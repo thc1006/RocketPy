@@ -1313,14 +1313,28 @@ class Flight:
             True if a parachute was triggered and the simulation should break.
         """
         for parachute in overshootable_node.parachutes:
+            is_ascending = overshootable_node.y_sol[5] >= 0
+            trigger_falling_only = getattr(parachute, "trigger_falling_only", False)
+            trigger_needs_height = getattr(parachute, "trigger_needs_height", True)
+
+            if trigger_falling_only and is_ascending:
+                # Fast path
+                self.__calculate_and_save_pressure_signals(
+                    parachute,
+                    overshootable_node.t,
+                    overshootable_node.y_sol[2],
+                    skip_height=True,
+                )
+                continue
+
             # Calculate and save pressure signal
-            (
-                noisy_pressure,
-                height_above_ground_level,
-            ) = self.__calculate_and_save_pressure_signals(
-                parachute,
-                overshootable_node.t,
-                overshootable_node.y_sol[2],
+            noisy_pressure, height_above_ground_level = (
+                self.__calculate_and_save_pressure_signals(
+                    parachute,
+                    overshootable_node.t,
+                    overshootable_node.y_sol[2],
+                    skip_height=not trigger_needs_height,
+                )
             )
 
             # Check for parachute trigger
@@ -1377,7 +1391,7 @@ class Flight:
 
         return False
 
-    def __calculate_and_save_pressure_signals(self, parachute, t, z):
+    def __calculate_and_save_pressure_signals(self, parachute, t, z, skip_height=False):
         """Gets noise and pressure signals and saves them in the parachute
         object given the current time and altitude.
 
@@ -1403,6 +1417,9 @@ class Flight:
         # Stores in the parachute object
         parachute.clean_pressure_signal.append([t, pressure])
         parachute.noise_signal.append([t, noise])
+
+        if skip_height:
+            return noisy_pressure, 0.0
 
         # Gets height above ground level considering noise
         height_above_ground_level = (

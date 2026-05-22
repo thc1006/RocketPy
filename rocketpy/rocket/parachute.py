@@ -291,19 +291,20 @@ class Parachute:
         self.noisy_pressure_signal_function = Function(0)
         self.noise_signal_function = Function(0)
         alpha, beta = self.noise_corr
-        self.noise_function = lambda: (
-            alpha * self.noise_signal[-1][1]
-            + beta * np.random.normal(noise[0], noise[1])
-        )
-
-        self.prints = _ParachutePrints(self)
-
-        self.__evaluate_trigger_function(trigger)
+        if noise == (0, 0, 0):
+            self.noise_function = lambda: 0.0
+        else:
+            self.noise_function = lambda: (
+                alpha * self.noise_signal[-1][1]
+                + beta * np.random.normal(noise[0], noise[1])
+            )
 
     def __evaluate_trigger_function(self, trigger):
         """This is used to set the triggerfunc attribute that will be used to
         interact with the Flight class.
         """
+        self._trigger_falling_only = False
+        self._trigger_needs_height = True
         # pylint: disable=unused-argument, function-redefined
 
         # Case 1: The parachute is deployed by a custom function
@@ -321,6 +322,8 @@ class Parachute:
 
         # Case 2: The parachute is deployed at a given height
         elif isinstance(trigger, (int, float)):
+            self._trigger_falling_only = True
+
             # The parachute is deployed at a given height
             def triggerfunc(p, h, y, sensors):
                 # p = pressure considering parachute noise signal
@@ -332,6 +335,9 @@ class Parachute:
 
         # Case 3: The parachute is deployed at apogee
         elif trigger.lower() == "apogee":
+            self._trigger_falling_only = True
+            self._trigger_needs_height = False
+
             # The parachute is deployed at apogee
             def triggerfunc(p, h, y, sensors):
                 # p = pressure considering parachute noise signal
