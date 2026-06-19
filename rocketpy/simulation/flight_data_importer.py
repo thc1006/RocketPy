@@ -268,6 +268,9 @@ class FlightDataImporter:
                 + str(self._original_columns[filepath])
             ) from e
 
+        _, unique_idx = np.unique(times, return_index=True)
+        times = times[np.sort(unique_idx)]
+
         created = []
         for col, name in self._columns_map[filepath].items():
             if name == "time":  # Handle time separately
@@ -283,7 +286,7 @@ class FlightDataImporter:
                 continue
 
             # Extract values for the current column
-            values = self._data[filepath][:, col_idx]
+            values = self._data[filepath][:, col_idx][unique_idx]
 
             # Convert units if necessary
             if units and col in units:

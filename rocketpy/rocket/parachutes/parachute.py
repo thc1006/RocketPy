@@ -214,6 +214,8 @@ class Parachute(ABC):
         so Flight can pass both sensors and u_dot when needed.
         """
         # pylint: disable=unused-argument, function-redefined
+        self._trigger_falling_only = False
+        self._trigger_needs_height = True
 
         # Helper to wrap any callable to the internal (p, h, y, sensors, u_dot) API
         def _make_wrapper(fn):
@@ -268,6 +270,7 @@ class Parachute(ABC):
 
         # Numeric altitude trigger
         if isinstance(trigger, (int, float)):
+            self._trigger_falling_only = True
 
             def triggerfunc(p, h, y, sensors, u_dot):  # pylint: disable=unused-argument
                 # p = pressure considering parachute noise signal
@@ -281,6 +284,8 @@ class Parachute(ABC):
 
         # Special case: "apogee"
         if isinstance(trigger, str) and trigger.lower() == "apogee":
+            self._trigger_falling_only = True
+            self._trigger_needs_height = False
 
             def triggerfunc(p, h, y, sensors, u_dot):  # pylint: disable=unused-argument
                 return y[5] < 0
