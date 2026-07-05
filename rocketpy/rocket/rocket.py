@@ -612,7 +612,6 @@ class Rocket:
         self.reduced_mass : Function
             Function of time expressing the reduced mass of the rocket.
         """
-        # TODO: add tests for reduced_mass values
         # Make sure there is a motor associated with the rocket
         if self.motor is None:
             logger.warning("Please associate this rocket with a motor!")

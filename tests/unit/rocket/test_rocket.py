@@ -996,3 +996,52 @@ def test_power_drag_exposed_as_function_objects_and_inputs_preserved():
     # Raw user input is preserved for serialization / round-tripping.
     assert rocket._power_off_drag_input == off_input
     assert rocket._power_on_drag_input == on_input
+
+
+def test_evaluate_reduced_mass_without_motor(calisto_motorless):
+    """Test evaluate_reduced_mass returns False when there is no motor
+    associated with the rocket (self.motor is None).
+    """
+    # Arrange
+    rocket = calisto_motorless
+    rocket.motor = None
+
+    # Act
+    result = rocket.evaluate_reduced_mass()
+
+    # Assert
+    assert result is False
+
+
+def test_evaluate_reduced_mass_empty_motor(calisto_motorless):
+    """Test evaluate_reduced_mass returns a Function evaluating to 0 when
+    the motor is an EmptyMotor.
+    """
+    # Arrange
+    rocket = calisto_motorless
+
+    # Act
+    reduced_mass = rocket.evaluate_reduced_mass()
+
+    # Assert
+    assert isinstance(reduced_mass, Function)
+    assert reduced_mass(0) == pytest.approx(0)
+
+
+def test_evaluate_reduced_mass_with_motor(calisto):
+    """Test evaluate_reduced_mass returns the correct Function when a motor
+    is associated with the rocket.
+    """
+    # Arrange
+    rocket = calisto
+    dry_mass = rocket.dry_mass
+    prop_mass = rocket.motor.propellant_mass
+
+    # Act
+    reduced_mass = rocket.evaluate_reduced_mass()
+
+    # Assert
+    assert isinstance(reduced_mass, Function)
+    for t in [0.0, 1.0, 2.0, 3.0]:
+        expected = prop_mass(t) * dry_mass / (prop_mass(t) + dry_mass)
+        assert reduced_mass(t) == pytest.approx(expected)
