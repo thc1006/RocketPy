@@ -171,6 +171,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         append=False,
         parallel=False,
         n_workers=None,
+        *,
+        random_seed=None,
         **kwargs,
     ):
         """
@@ -190,6 +192,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             number of workers will be equal to the number of CPUs available.
             A minimum of 2 workers is required for parallel mode.
             Default is None.
+        random_seed : int, numpy.random.SeedSequence, numpy.random.Generator, optional
+            Root seed for the run. When provided, the sampled inputs are
+            reproducible and identical across serial and parallel execution
+            and across any number of workers, because each simulation index
+            draws from its own child stream spawned from this root
+            (``SeedSequence(random_seed).spawn(number_of_simulations)``). It
+            accepts an int, a ``SeedSequence`` or a ``Generator``. Default is
+            None, which draws fresh entropy (not reproducible), preserving the
+            previous behavior.
         kwargs : dict
             Custom arguments for simulation export of the ``inputs`` file. Options
             are:
@@ -229,9 +240,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self.__setup_files(append)
 
         if parallel:
-            self.__run_in_parallel(n_workers)
+            self.__run_in_parallel(n_workers, random_seed)
         else:
-            self.__run_in_serial()
+            self.__run_in_serial(random_seed)
 
         self.__terminate_simulation()
 
@@ -268,9 +279,45 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         except OSError as error:
             raise OSError(f"Error creating files: {error}") from error
 
-    def __run_in_serial(self):
+    @staticmethod
+    def __root_seed_sequence(random_seed):
+        """Return a ``SeedSequence`` root from a flexible seed argument.
+
+        Accepts what the scientific-Python SPEC 7 seeding convention accepts
+        (an int, a ``SeedSequence``, a ``Generator`` or ``BitGenerator``, or
+        None for fresh entropy) and returns a ``SeedSequence`` so it can be
+        spawned into one independent child stream per simulation index.
+        """
+        if isinstance(random_seed, np.random.SeedSequence):
+            return random_seed
+        if isinstance(random_seed, np.random.Generator):
+            return random_seed.bit_generator.seed_seq
+        if isinstance(random_seed, np.random.BitGenerator):
+            return random_seed.seed_seq
+        return np.random.SeedSequence(random_seed)
+
+    def __seed_simulation(self, child_seed):
+        """Reseed the stochastic models for a single simulation index.
+
+        The per-index child seed is split three ways so the environment,
+        rocket and flight draw from independent streams instead of sharing
+        one. Seeding per simulation index (not per worker) is what makes the
+        sampled inputs invariant to the execution mode and to the number of
+        workers.
+        """
+        env_seed, rocket_seed, flight_seed = child_seed.spawn(3)
+        self.environment._set_stochastic(env_seed)
+        self.rocket._set_stochastic(rocket_seed)
+        self.flight._set_stochastic(flight_seed)
+
+    def __run_in_serial(self, random_seed=None):  # pylint: disable=too-many-statements
         """
         Runs the monte carlo simulation in serial mode.
+
+        Parameters
+        ----------
+        random_seed : int, SeedSequence, Generator, optional
+            Root seed for the run. See ``simulate``.
 
         Returns
         -------
@@ -281,14 +328,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             n_simulations=self.number_of_simulations,
             start_time=time(),
         )
+        child_seeds = self.__root_seed_sequence(random_seed).spawn(
+            self.number_of_simulations
+        )
         try:
             while sim_monitor.keep_simulating():
-                sim_monitor.increment()
+                sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
+                self.__seed_simulation(child_seeds[sim_idx])
                 flight = self.__run_single_simulation()
-                inputs_json = self.__evaluate_flight_inputs(sim_monitor.count)
-                outputs_json = self.__evaluate_flight_outputs(flight, sim_monitor.count)
+                inputs_json = self.__evaluate_flight_inputs(sim_idx)
+                outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
                 with open(self.input_file, "a", encoding="utf-8") as f:
                     f.write(inputs_json)
@@ -310,7 +361,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f.write(inputs_json)
             raise error
 
-    def __run_in_parallel(self, n_workers=None):
+    def __run_in_parallel(self, n_workers=None, random_seed=None):
         """
         Runs the monte carlo simulation in parallel.
 
@@ -319,6 +370,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         n_workers: int, optional
             Number of workers to be used. If None, the number of workers
             will be equal to the number of CPUs available. Default is None.
+        random_seed : int, SeedSequence, Generator, optional
+            Root seed for the run. See ``simulate``.
 
         Returns
         -------
@@ -340,13 +393,19 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
 
             processes = []
-            seeds = np.random.SeedSequence().spawn(n_workers)
+            # One independent child seed per simulation index (not per
+            # worker), shared with every worker. The shared counter assigns
+            # indices, and index i always seeds from child_seeds[i], so the
+            # sampled inputs do not depend on the number of workers.
+            child_seeds = self.__root_seed_sequence(random_seed).spawn(
+                self.number_of_simulations
+            )
 
-            for seed in seeds:
+            for _ in range(n_workers):
                 sim_producer = multiprocess.Process(
                     target=self.__sim_producer,
                     args=(
-                        seed,
+                        child_seeds,
                         sim_monitor,
                         mutex,
                         simulation_error_event,
@@ -388,13 +447,16 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             raise ValueError("Number of workers must be at least 2 for parallel mode.")
         return n_workers
 
-    def __sim_producer(self, seed, sim_monitor, mutex, error_event):  # pylint: disable=too-many-statements
+    def __sim_producer(self, child_seeds, sim_monitor, mutex, error_event):  # pylint: disable=too-many-statements
         """Simulation producer to be used in parallel by multiprocessing.
 
         Parameters
         ----------
-        seed : int
-            The seed to set the random number generator.
+        child_seeds : list[numpy.random.SeedSequence]
+            One seed sequence per simulation index. Before each simulation
+            the worker seeds the stochastic models from
+            ``child_seeds[sim_idx]``, where ``sim_idx`` comes from the shared
+            counter, so the inputs are invariant to the number of workers.
         sim_monitor : _SimMonitor
             The simulation monitor object to keep track of the simulations.
         mutex : multiprocess.Lock
@@ -403,15 +465,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             Event signaling an error occurred during the simulation.
         """
         try:
-            # Ensure Processes generate different random numbers
-            self.environment._set_stochastic(seed)
-            self.rocket._set_stochastic(seed)
-            self.flight._set_stochastic(seed)
-
             while sim_monitor.keep_simulating():
                 sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
+                self.__seed_simulation(child_seeds[sim_idx])
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
