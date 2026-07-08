@@ -1,193 +1,140 @@
-"""Determinism tests for the ``random_seed`` argument of ``MonteCarlo.simulate``.
+"""Unit tests for the Monte Carlo seeding helpers.
 
-With a fixed ``random_seed`` the generated random *inputs* are reproducible and
-identical across serial and parallel execution and across any number of workers.
-Each simulation index draws from its own child stream spawned from the run's root
-seed, and ``SeedSequence.spawn`` is prefix-stable, so index ``i`` maps to the same
-seed regardless of the worker that runs it.
+``MonteCarlo.simulate(random_seed=...)`` makes the sampled inputs reproducible by
+turning the run's root seed into one independent child stream per simulation
+index. Two private helpers do the work:
 
-The trajectory integration (``Flight``) is stubbed so the tests stay fast: worker
-invariance is a property of the input sampling, which happens before ``Flight`` is
-built. Stubbing the module-level ``Flight`` symbol reaches the parallel workers
-only under the ``fork`` start method, so those tests are guarded accordingly.
+* ``__root_seed_sequence`` normalizes the flexible ``random_seed`` argument (int,
+  ``SeedSequence``, ``Generator``, ``BitGenerator`` or None) into a
+  ``SeedSequence`` that can be spawned;
+* ``__seed_simulation`` splits one per-index child seed three ways so the
+  environment, rocket and flight draw from independent streams.
 
-A dedicated numpy-only rocket is used so *all* randomness flows through the seeded
-numpy generator. List-valued stochastic attributes are sampled with the standard
-library ``random.choice`` (an unseeded global generator) which ``random_seed``
-does not govern; the fixture drops the only such attribute (a multi-element
-``thrust_source``) so the inputs are byte-for-byte reproducible from the seed.
+These tests exercise the helpers directly, with no fixtures and no simulation, so
+they stay fast. The end-to-end reproducibility of ``simulate`` (serial and across
+workers) is covered by ``tests/integration/simulation/test_monte_carlo_determinism``.
+
+Reaching a name-mangled member is an established pattern in this suite (see
+``tests/unit/test_sensitivity.py`` and ``tests/unit/environment/test_environment.py``);
+it lets the seeding invariants be asserted without running a Monte Carlo.
 """
 
-import json
+from types import SimpleNamespace
 
-import multiprocess
+import numpy as np
 import pytest
 
-import rocketpy.simulation.monte_carlo as mc_module
 from rocketpy.simulation import MonteCarlo
-from rocketpy.stochastic import StochasticRocket, StochasticSolidMotor
 
-pytestmark = pytest.mark.slow
+_root_seed_sequence = MonteCarlo._MonteCarlo__root_seed_sequence
+_seed_simulation = MonteCarlo._MonteCarlo__seed_simulation
 
-requires_fork = pytest.mark.skipif(
-    multiprocess.get_start_method() != "fork",
-    reason="stub-based parallel determinism test requires the 'fork' start method",
+
+def _entropy(seed_sequence, n=4):
+    """A stable, comparable fingerprint of a ``SeedSequence``'s stream."""
+    return tuple(int(x) for x in seed_sequence.generate_state(n))
+
+
+# --------------------------------------------------------------------------- #
+# __root_seed_sequence: normalizing the flexible seed argument                #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "make_seed",
+    [
+        pytest.param(lambda: 12345, id="int"),
+        pytest.param(lambda: np.random.SeedSequence(12345), id="seedsequence"),
+        pytest.param(lambda: np.random.default_rng(12345), id="generator"),
+        pytest.param(lambda: np.random.PCG64(12345), id="bitgenerator"),
+    ],
 )
+def test_root_seed_sequence_accepts_supported_types(make_seed):
+    """int, SeedSequence, Generator and BitGenerator all normalize to the same
+    root SeedSequence stream for an equivalent seed value."""
+    root = _root_seed_sequence(make_seed())
+    assert isinstance(root, np.random.SeedSequence)
+    assert _entropy(root) == _entropy(_root_seed_sequence(12345))
 
 
-class _StubFlight:
-    """Minimal stand-in for ``Flight`` that skips trajectory integration."""
-
-    def __init__(self, **kwargs):  # accepts and ignores MonteCarlo's Flight kwargs
-        pass
-
-    def __getattr__(self, name):
-        return 0.0
+def test_root_seed_sequence_none_draws_fresh_entropy():
+    """None yields a SeedSequence seeded from fresh OS entropy (not reproducible)."""
+    root = _root_seed_sequence(None)
+    assert isinstance(root, np.random.SeedSequence)
+    assert root.entropy is not None
 
 
-@pytest.fixture
-def stochastic_calisto_numpy_only(
-    cesaroni_m1670,
-    calisto_robust,
-    stochastic_nose_cone,
-    stochastic_trapezoidal_fins,
-    stochastic_tail,
-    stochastic_rail_buttons,
-    stochastic_main_parachute,
-    stochastic_drogue_parachute,
-):
-    """A ``StochasticRocket`` whose randomness flows entirely through numpy.
+@pytest.mark.parametrize(
+    "make_seed, resolve",
+    [
+        pytest.param(
+            lambda: np.random.SeedSequence(999),
+            lambda seed: seed,
+            id="seedsequence",
+        ),
+        pytest.param(
+            lambda: np.random.default_rng(999),
+            lambda seed: seed.bit_generator.seed_seq,
+            id="generator",
+        ),
+        pytest.param(
+            lambda: np.random.PCG64(999),
+            lambda seed: seed.seed_seq,
+            id="bitgenerator",
+        ),
+    ],
+)
+def test_root_seed_sequence_reuses_existing_seed_sequence(make_seed, resolve):
+    """When given something that already carries a SeedSequence, the helper
+    reuses that object rather than copying it."""
+    seed = make_seed()
+    assert _root_seed_sequence(seed) is resolve(seed)
 
-    Mirrors the shared ``stochastic_calisto`` fixture but gives the solid motor a
-    single ``thrust_source`` instead of a multi-element list, so no attribute is
-    sampled through the unseeded standard-library ``random.choice``.
-    """
-    motor = StochasticSolidMotor(
-        solid_motor=cesaroni_m1670,
-        burn_out_time=(4, 0.1),
-        grains_center_of_mass_position=0.001,
-        grain_density=50,
-        grain_separation=1 / 1000,
-        grain_initial_height=1 / 1000,
-        grain_initial_inner_radius=0.375 / 1000,
-        grain_outer_radius=0.375 / 1000,
-        total_impulse=(6500, 1000),
-        throat_radius=0.5 / 1000,
-        nozzle_radius=0.5 / 1000,
-        nozzle_position=0.001,
+
+# --------------------------------------------------------------------------- #
+# __seed_simulation: splitting one child seed across the three models         #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingModel:
+    """Stand-in stochastic model that records the seeds it is handed."""
+
+    def __init__(self):
+        self.seeds = []
+
+    def _set_stochastic(self, seed=None):
+        self.seeds.append(seed)
+
+
+def _split_seeds(child_seed):
+    """Run ``__seed_simulation`` against recording models; return the three seeds."""
+    models = SimpleNamespace(
+        environment=_RecordingModel(),
+        rocket=_RecordingModel(),
+        flight=_RecordingModel(),
     )
-    rocket = StochasticRocket(
-        rocket=calisto_robust,
-        radius=0.0127 / 2000,
-        mass=(15.426, 0.5, "normal"),
-        inertia_11=(6.321, 0),
-        inertia_22=0.01,
-        inertia_33=0.01,
-        center_of_mass_without_motor=0,
-    )
-    rocket.add_motor(motor, position=0.001)
-    rocket.add_nose(stochastic_nose_cone, position=(1.134, 0.001))
-    rocket.add_trapezoidal_fins(stochastic_trapezoidal_fins, position=(0.001, "normal"))
-    rocket.add_tail(stochastic_tail)
-    rocket.set_rail_buttons(
-        stochastic_rail_buttons, lower_button_position=(-0.618, 0.001, "normal")
-    )
-    rocket.add_parachute(parachute=stochastic_main_parachute)
-    rocket.add_parachute(parachute=stochastic_drogue_parachute)
-    return rocket
+    _seed_simulation(models, child_seed)
+    return models.environment.seeds, models.rocket.seeds, models.flight.seeds
 
 
-def _read_inputs_by_index(input_file):
-    """Read a ``.inputs.txt`` file into ``{index: raw_json_line}``."""
-    by_index = {}
-    with open(input_file, mode="r", encoding="utf-8") as rows:
-        for line in rows:
-            line = line.strip()
-            if not line:
-                continue
-            by_index[json.loads(line)["index"]] = line
-    return by_index
+def test_seed_simulation_decorrelates_env_rocket_flight():
+    """The per-index child seed is split three ways so environment, rocket and
+    flight draw from independent streams instead of sharing one."""
+    env_seeds, rocket_seeds, flight_seeds = _split_seeds(np.random.SeedSequence(2024))
+    assert [len(env_seeds), len(rocket_seeds), len(flight_seeds)] == [1, 1, 1]
+    fingerprints = {
+        _entropy(env_seeds[0]),
+        _entropy(rocket_seeds[0]),
+        _entropy(flight_seeds[0]),
+    }
+    assert len(fingerprints) == 3
 
 
-def _simulate_inputs(
-    monkeypatch, tmp_path, environment, rocket, flight, tag, **simulate_kwargs
-):
-    """Run a Monte Carlo with a stubbed ``Flight`` and return inputs by index."""
-    monkeypatch.setattr(mc_module, "Flight", _StubFlight)
-    montecarlo = MonteCarlo(
-        filename=str(tmp_path / tag),
-        environment=environment,
-        rocket=rocket,
-        flight=flight,
-    )
-    montecarlo.simulate(**simulate_kwargs)
-    return _read_inputs_by_index(montecarlo.input_file)
+def test_seed_simulation_is_deterministic_per_child():
+    """A given child seed reseeds the three models identically every time."""
 
+    def split(child):
+        env, rocket, flight = _split_seeds(child)
+        return [_entropy(env[0]), _entropy(rocket[0]), _entropy(flight[0])]
 
-def test_serial_inputs_are_reproducible(
-    monkeypatch,
-    tmp_path,
-    stochastic_environment,
-    stochastic_calisto_numpy_only,
-    stochastic_flight,
-):
-    """Two serial runs with the same random_seed yield identical inputs."""
-    models = (stochastic_environment, stochastic_calisto_numpy_only, stochastic_flight)
-    run_a = _simulate_inputs(
-        monkeypatch, tmp_path, *models, "a", number_of_simulations=6, random_seed=7
-    )
-    run_b = _simulate_inputs(
-        monkeypatch, tmp_path, *models, "b", number_of_simulations=6, random_seed=7
-    )
-    assert sorted(run_a) == list(range(6))
-    assert run_a == run_b
-
-
-@requires_fork
-def test_inputs_are_worker_invariant(
-    monkeypatch,
-    tmp_path,
-    stochastic_environment,
-    stochastic_calisto_numpy_only,
-    stochastic_flight,
-):
-    """serial == parallel(2) == parallel(4): inputs are bit-identical per index."""
-    models = (stochastic_environment, stochastic_calisto_numpy_only, stochastic_flight)
-    common = {"number_of_simulations": 8, "random_seed": 314159}
-
-    serial = _simulate_inputs(monkeypatch, tmp_path, *models, "serial", **common)
-    par2 = _simulate_inputs(
-        monkeypatch, tmp_path, *models, "par2", parallel=True, n_workers=2, **common
-    )
-    par4 = _simulate_inputs(
-        monkeypatch, tmp_path, *models, "par4", parallel=True, n_workers=4, **common
-    )
-
-    expected = list(range(8))
-    assert sorted(serial) == expected
-    assert sorted(par2) == expected
-    assert sorted(par4) == expected
-    for index in expected:
-        assert serial[index] == par2[index], f"serial vs parallel(2) differ at {index}"
-        assert serial[index] == par4[index], f"serial vs parallel(4) differ at {index}"
-
-
-def test_none_seed_still_runs(
-    monkeypatch,
-    tmp_path,
-    stochastic_environment,
-    stochastic_calisto_numpy_only,
-    stochastic_flight,
-):
-    """random_seed=None draws fresh entropy but still exports one record per index."""
-    inputs = _simulate_inputs(
-        monkeypatch,
-        tmp_path,
-        stochastic_environment,
-        stochastic_calisto_numpy_only,
-        stochastic_flight,
-        "none",
-        number_of_simulations=5,
-        random_seed=None,
-    )
-    assert sorted(inputs) == list(range(5))
+    assert split(np.random.SeedSequence(2024)) == split(np.random.SeedSequence(2024))
