@@ -39,6 +39,7 @@ Attention: The newest changes should be on top -->
 - ENH: Add Qodo PR-Agent workflow using Google Gemini [#1089](https://github.com/RocketPy-Team/RocketPy/pull/1089)
 - ENH: Support for Meteomatics API in the `Environment` class [#1079](https://github.com/RocketPy-Team/RocketPy/pull/1079)
 - ENH: update master with develop [#1081](https://github.com/RocketPy-Team/RocketPy/pull/1081)
+- ENH: reproducible Monte Carlo runs via a random_seed argument [#1054](https://github.com/RocketPy-Team/RocketPy/pull/1054)
 
 ### Changed
 

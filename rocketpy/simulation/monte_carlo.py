@@ -192,15 +192,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             number of workers will be equal to the number of CPUs available.
             A minimum of 2 workers is required for parallel mode.
             Default is None.
-        random_seed : int, numpy.random.SeedSequence, numpy.random.Generator, optional
+        random_seed : int or numpy.random.SeedSequence, optional
             Root seed for the run. When provided, the sampled inputs are
             reproducible and identical across serial and parallel execution
             and across any number of workers, because each simulation index
-            draws from its own child stream spawned from this root
-            (``SeedSequence(random_seed).spawn(number_of_simulations)``). It
-            accepts an int, a ``SeedSequence`` or a ``Generator``. Default is
-            None, which draws fresh entropy (not reproducible), preserving the
-            previous behavior.
+            draws from its own child stream spawned from this root. It accepts
+            an int or a ``SeedSequence``; a supplied ``SeedSequence`` is copied
+            rather than consumed, so repeated calls with the same seed produce
+            the same inputs. Default is None, which draws fresh entropy (not
+            reproducible), preserving the previous behavior.
         kwargs : dict
             Custom arguments for simulation export of the ``inputs`` file. Options
             are:
@@ -281,19 +281,26 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
     @staticmethod
     def __root_seed_sequence(random_seed):
-        """Return a ``SeedSequence`` root from a flexible seed argument.
+        """Build a fresh ``SeedSequence`` root from ``random_seed``.
 
-        Accepts what the scientific-Python SPEC 7 seeding convention accepts
-        (an int, a ``SeedSequence``, a ``Generator`` or ``BitGenerator``, or
-        None for fresh entropy) and returns a ``SeedSequence`` so it can be
-        spawned into one independent child stream per simulation index.
+        ``random_seed`` may be an int (or any entropy ``numpy.random.SeedSequence``
+        accepts), an existing ``SeedSequence``, or ``None`` for fresh entropy. A
+        supplied ``SeedSequence`` is copied from its full ``state``, so the
+        spawning below neither mutates the caller's object nor advances a shared
+        child counter between calls; repeated ``simulate`` calls with the same
+        seed then stay reproducible. A stateful ``Generator``/``BitGenerator`` is
+        not accepted, since using it as an immutable seed would contradict its
+        consume-on-use semantics; pass ``rng.bit_generator.seed_seq`` to seed
+        from an existing generator's stream.
         """
         if isinstance(random_seed, np.random.SeedSequence):
-            return random_seed
-        if isinstance(random_seed, np.random.Generator):
-            return random_seed.bit_generator.seed_seq
-        if isinstance(random_seed, np.random.BitGenerator):
-            return random_seed.seed_seq
+            return np.random.SeedSequence(**random_seed.state)
+        if isinstance(random_seed, (np.random.Generator, np.random.BitGenerator)):
+            raise TypeError(
+                "random_seed must be an int or a numpy.random.SeedSequence, not "
+                f"a {type(random_seed).__name__}; to seed from an existing "
+                "generator pass rng.bit_generator.seed_seq."
+            )
         return np.random.SeedSequence(random_seed)
 
     def __seed_simulation(self, child_seed):
@@ -316,7 +323,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
         Parameters
         ----------
-        random_seed : int, SeedSequence, Generator, optional
+        random_seed : int or SeedSequence, optional
             Root seed for the run. See ``simulate``.
 
         Returns
@@ -370,7 +377,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         n_workers: int, optional
             Number of workers to be used. If None, the number of workers
             will be equal to the number of CPUs available. Default is None.
-        random_seed : int, SeedSequence, Generator, optional
+        random_seed : int or SeedSequence, optional
             Root seed for the run. See ``simulate``.
 
         Returns
@@ -465,8 +472,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             Event signaling an error occurred during the simulation.
         """
         try:
-            while sim_monitor.keep_simulating():
-                sim_idx = sim_monitor.increment() - 1
+            while True:
+                sim_idx = _claim_next_index(sim_monitor, mutex)
+                if sim_idx is None:
+                    break
+
                 inputs_json, outputs_json = "", ""
 
                 self.__seed_simulation(child_seeds[sim_idx])
@@ -1680,6 +1690,24 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             If no error data is available to export.
         """
         self._write_log_to_json(self.errors_log, filename)
+
+
+def _claim_next_index(sim_monitor, mutex):
+    """Atomically claim the next 0-based simulation index, or ``None`` if done.
+
+    ``keep_simulating()`` and ``increment()`` are two separate manager calls, so
+    the shared ``mutex`` has to be held across both. Without it, two workers can
+    each pass the ``count < number_of_simulations`` check at the tail before
+    either increments, and both then claim an index, overrunning the requested
+    number of simulations and indexing past the per-index seed list.
+    """
+    mutex.acquire()
+    try:
+        if not sim_monitor.keep_simulating():
+            return None
+        return sim_monitor.increment() - 1
+    finally:
+        mutex.release()
 
 
 def _import_multiprocess():
