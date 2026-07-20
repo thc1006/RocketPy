@@ -192,15 +192,22 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             number of workers will be equal to the number of CPUs available.
             A minimum of 2 workers is required for parallel mode.
             Default is None.
-        random_seed : int or numpy.random.SeedSequence, optional
+        random_seed : int, numpy integer, sequence of ints, or SeedSequence, optional
             Root seed for the run. When provided, the sampled inputs are
-            reproducible and identical across serial and parallel execution
-            and across any number of workers, because each simulation index
-            draws from its own child stream spawned from this root. It accepts
-            an int or a ``SeedSequence``; a supplied ``SeedSequence`` is copied
-            rather than consumed, so repeated calls with the same seed produce
-            the same inputs. Default is None, which draws fresh entropy (not
-            reproducible), preserving the previous behavior.
+            reproducible and identical across serial and parallel execution and
+            across any number of workers: each simulation index derives its own
+            decorrelated child stream from this root, so index ``i`` receives the
+            same inputs no matter which worker runs it. A supplied ``SeedSequence``
+            is copied from its full state rather than consumed, so repeated calls
+            with the same seed reproduce the same inputs. Each model is reseeded
+            with a 128-bit integer -- the seed type a custom sampler's
+            ``reset_seed`` accepts. A stateful ``numpy.random.Generator`` or
+            ``BitGenerator`` is rejected (it is an RNG to draw from, not a fixed
+            seed); pass ``rng.bit_generator.seed_seq`` to seed from one. Default is
+            None, which draws fresh entropy on each run -- the previous,
+            non-reproducible default. This seeding is informed by Scientific Python
+            SPEC 7 but keeps immutable seed-snapshot semantics rather than sharing a
+            ``Generator``.
         kwargs : dict
             Custom arguments for simulation export of the ``inputs`` file. Options
             are:
@@ -234,6 +241,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
+        # Small, picklable root seed state captured once per run; every
+        # simulation index derives its child seed from it (see __child_seed).
+        self.__root_state = None
 
         print("Starting Monte Carlo analysis")
 
@@ -303,6 +313,38 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
         return np.random.SeedSequence(random_seed)
 
+    def __capture_root_state(self, random_seed):
+        """Capture the small, picklable root seed state for this run.
+
+        Stored once so serial mode and every parallel worker derive the same
+        per-index child seeds from it (see ``__child_seed``), instead of
+        materializing and pickling the full ``spawn(number_of_simulations)``
+        list to each process.
+        """
+        root = self.__root_seed_sequence(random_seed)
+        self.__root_state = (
+            root.entropy,
+            root.spawn_key,
+            root.pool_size,
+            root.n_children_spawned,
+        )
+
+    def __child_seed(self, sim_idx):
+        """Return the seed sequence for a single simulation index.
+
+        This equals ``root.spawn(number_of_simulations)[sim_idx]`` but is O(1)
+        in time and memory: ``SeedSequence.spawn`` derives child ``i`` by
+        appending ``n_children_spawned + i`` to the parent ``spawn_key``, so
+        rebuilding that one child directly reproduces it bit-for-bit while
+        letting a worker reconstruct any index from the small root state alone.
+        """
+        entropy, spawn_key, pool_size, base = self.__root_state
+        return np.random.SeedSequence(
+            entropy=entropy,
+            spawn_key=(*spawn_key, base + sim_idx),
+            pool_size=pool_size,
+        )
+
     def __seed_simulation(self, child_seed):
         """Reseed the stochastic models for a single simulation index.
 
@@ -310,12 +352,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         rocket and flight draw from independent streams instead of sharing
         one. Seeding per simulation index (not per worker) is what makes the
         sampled inputs invariant to the execution mode and to the number of
-        workers.
+        workers. Each sub-stream is handed over as a 128-bit ``int`` (see
+        ``_seed_sequence_to_int``) so custom samplers keep working.
         """
         env_seed, rocket_seed, flight_seed = child_seed.spawn(3)
-        self.environment._set_stochastic(env_seed)
-        self.rocket._set_stochastic(rocket_seed)
-        self.flight._set_stochastic(flight_seed)
+        self.environment._set_stochastic(_seed_sequence_to_int(env_seed))
+        self.rocket._set_stochastic(_seed_sequence_to_int(rocket_seed))
+        self.flight._set_stochastic(_seed_sequence_to_int(flight_seed))
 
     def __run_in_serial(self, random_seed=None):  # pylint: disable=too-many-statements
         """
@@ -335,15 +378,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             n_simulations=self.number_of_simulations,
             start_time=time(),
         )
-        child_seeds = self.__root_seed_sequence(random_seed).spawn(
-            self.number_of_simulations
-        )
+        self.__capture_root_state(random_seed)
         try:
             while sim_monitor.keep_simulating():
                 sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
-                self.__seed_simulation(child_seeds[sim_idx])
+                self.__seed_simulation(self.__child_seed(sim_idx))
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
@@ -400,19 +441,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
 
             processes = []
-            # One independent child seed per simulation index (not per
-            # worker), shared with every worker. The shared counter assigns
-            # indices, and index i always seeds from child_seeds[i], so the
-            # sampled inputs do not depend on the number of workers.
-            child_seeds = self.__root_seed_sequence(random_seed).spawn(
-                self.number_of_simulations
-            )
+            # Each worker derives one independent child seed per simulation
+            # index (not per worker) from the shared root state: the counter
+            # assigns indices and index i always seeds from __child_seed(i), so
+            # the sampled inputs do not depend on the number of workers. The
+            # root state is small and travels with the pickled instance, so no
+            # per-index seed list is materialized or sent to each process.
+            self.__capture_root_state(random_seed)
 
             for _ in range(n_workers):
                 sim_producer = multiprocess.Process(
                     target=self.__sim_producer,
                     args=(
-                        child_seeds,
                         sim_monitor,
                         mutex,
                         simulation_error_event,
@@ -454,16 +494,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             raise ValueError("Number of workers must be at least 2 for parallel mode.")
         return n_workers
 
-    def __sim_producer(self, child_seeds, sim_monitor, mutex, error_event):  # pylint: disable=too-many-statements
+    def __sim_producer(self, sim_monitor, mutex, error_event):  # pylint: disable=too-many-statements
         """Simulation producer to be used in parallel by multiprocessing.
 
         Parameters
         ----------
-        child_seeds : list[numpy.random.SeedSequence]
-            One seed sequence per simulation index. Before each simulation
-            the worker seeds the stochastic models from
-            ``child_seeds[sim_idx]``, where ``sim_idx`` comes from the shared
-            counter, so the inputs are invariant to the number of workers.
         sim_monitor : _SimMonitor
             The simulation monitor object to keep track of the simulations.
         mutex : multiprocess.Lock
@@ -479,7 +514,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
                 inputs_json, outputs_json = "", ""
 
-                self.__seed_simulation(child_seeds[sim_idx])
+                self.__seed_simulation(self.__child_seed(sim_idx))
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
@@ -1692,14 +1727,34 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._write_log_to_json(self.errors_log, filename)
 
 
+def _seed_sequence_to_int(seed_sequence):
+    """Collapse a ``SeedSequence`` into a 128-bit Python ``int``.
+
+    A plain ``int`` is the one seed type accepted alike by
+    ``numpy.random.default_rng``, ``numpy.random.RandomState`` and the stdlib
+    ``random.Random`` (which rejects a ``SeedSequence`` with a ``TypeError``
+    since Python 3.11), so a custom sampler whose ``reset_seed`` documents an
+    ``int`` keeps working. All four ``uint32`` words are combined to keep the
+    full 128-bit pool, so the environment/rocket/flight sub-streams stay
+    decorrelated instead of collapsing to a single 32-bit word.
+
+    The words are combined by value (little-endian word order), not via
+    ``tobytes()``, so the seed is the same on big- and little-endian machines
+    -- a byte-order-dependent seed would break the cross-platform
+    reproducibility this whole scheme exists to provide.
+    """
+    words = seed_sequence.generate_state(4, dtype=np.uint32)
+    return sum(int(word) << (32 * position) for position, word in enumerate(words))
+
+
 def _claim_next_index(sim_monitor, mutex):
     """Atomically claim the next 0-based simulation index, or ``None`` if done.
 
     ``keep_simulating()`` and ``increment()`` are two separate manager calls, so
     the shared ``mutex`` has to be held across both. Without it, two workers can
     each pass the ``count < number_of_simulations`` check at the tail before
-    either increments, and both then claim an index, overrunning the requested
-    number of simulations and indexing past the per-index seed list.
+    either increments, and both then claim an index, running more simulations
+    than were requested (and duplicating a simulation index).
     """
     mutex.acquire()
     try:
