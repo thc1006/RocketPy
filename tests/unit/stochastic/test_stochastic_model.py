@@ -1,6 +1,38 @@
+from types import SimpleNamespace
+
 import pytest
 
 from rocketpy.stochastic import StochasticFreeFormFins
+from rocketpy.stochastic.stochastic_model import StochasticModel
+
+
+def _sampled_option(model):
+    """Return the value ``dict_generator`` picks for the ``options`` attribute."""
+    return next(model.dict_generator())["options"]
+
+
+def test_list_attribute_sampling_is_reproducible_under_seed():
+    """A list-valued stochastic attribute is drawn through the model's own seeded
+    numpy generator, so a fixed seed reproduces the choice. It used to be drawn
+    with the stdlib ``random.choice`` (an unseeded global instance), which
+    ``random_seed`` could not govern. Heterogeneous entries (paths, callables,
+    lists) are returned unchanged rather than coerced to a numpy dtype the way
+    ``numpy.random.choice`` would.
+    """
+    options = ["/motor/a.eng", "/motor/b.eng", (lambda t: t), [1, 2, 3]]
+    model = StochasticModel(obj=SimpleNamespace(), options=options)
+
+    model._set_stochastic(42)
+    first = _sampled_option(model)
+    model._set_stochastic(42)
+    assert _sampled_option(model) == first, "same seed must reproduce the choice"
+    assert any(first is option for option in options), "object returned unchanged"
+
+    chosen_ids = set()
+    for seed in range(16):
+        model._set_stochastic(seed)
+        chosen_ids.add(id(_sampled_option(model)))
+    assert len(chosen_ids) > 1, "different seeds must be able to pick differently"
 
 
 @pytest.mark.parametrize(
