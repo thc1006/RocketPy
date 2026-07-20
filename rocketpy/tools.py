@@ -1467,6 +1467,29 @@ def find_obj_from_hash(obj, hash_, depth_limit=None):
     return None
 
 
+def _seed_sequence_to_int(seed_sequence):
+    """Collapse a ``SeedSequence`` into a 128-bit Python ``int``.
+
+    A plain ``int`` is what ``numpy.random.default_rng`` and the stdlib
+    ``random.Random`` both accept (``random.Random`` rejects a ``SeedSequence``
+    with a ``TypeError`` since Python 3.11), so a custom sampler whose
+    ``reset_seed`` documents an ``int`` and builds a modern generator keeps
+    working. The legacy ``numpy.random.RandomState`` is the exception: it caps a
+    single-integer seed at ``2**32 - 1``, so a sampler still built on it would
+    have to reduce the value (``RandomState`` is a frozen legacy API NumPy steers
+    new code away from). All four ``uint32`` words are combined to keep the full
+    128-bit pool, so sub-streams stay decorrelated instead of collapsing to a
+    single 32-bit word.
+
+    The words are combined by value (little-endian word order), not via
+    ``tobytes()``, so the seed is the same on big- and little-endian machines --
+    a byte-order-dependent seed would break the cross-platform reproducibility
+    this exists to provide.
+    """
+    words = seed_sequence.generate_state(4, dtype=np.uint32)
+    return sum(int(word) << (32 * position) for position, word in enumerate(words))
+
+
 if __name__ == "__main__":  # pragma: no cover
     import doctest
 

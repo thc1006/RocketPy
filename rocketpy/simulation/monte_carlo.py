@@ -31,6 +31,7 @@ from rocketpy.plots.monte_carlo_plots import _MonteCarloPlots
 from rocketpy.prints.monte_carlo_prints import _MonteCarloPrints
 from rocketpy.simulation.flight import Flight
 from rocketpy.tools import (
+    _seed_sequence_to_int,
     generate_monte_carlo_ellipses,
     generate_monte_carlo_ellipses_coordinates,
     import_optional_dependency,
@@ -241,18 +242,22 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
-        # Small, picklable root seed state captured once per run; every
-        # simulation index derives its child seed from it (see __child_seed).
-        self.__root_state = None
+
+        # Capture the small, picklable root seed state once per run (every
+        # simulation index derives its child seed from it, see __child_seed).
+        # This validates random_seed *before* __setup_files truncates any
+        # existing output, so an invalid seed cannot destroy prior results on
+        # the way to raising.
+        self.__capture_root_state(random_seed)
 
         print("Starting Monte Carlo analysis")
 
         self.__setup_files(append)
 
         if parallel:
-            self.__run_in_parallel(n_workers, random_seed)
+            self.__run_in_parallel(n_workers)
         else:
-            self.__run_in_serial(random_seed)
+            self.__run_in_serial()
 
         self.__terminate_simulation()
 
@@ -360,14 +365,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self.rocket._set_stochastic(_seed_sequence_to_int(rocket_seed))
         self.flight._set_stochastic(_seed_sequence_to_int(flight_seed))
 
-    def __run_in_serial(self, random_seed=None):  # pylint: disable=too-many-statements
+    def __run_in_serial(self):  # pylint: disable=too-many-statements
         """
         Runs the monte carlo simulation in serial mode.
 
-        Parameters
-        ----------
-        random_seed : int or SeedSequence, optional
-            Root seed for the run. See ``simulate``.
+        The root seed state is captured by ``simulate`` before this runs, so each
+        simulation index derives its child seed from ``self.__root_state``.
 
         Returns
         -------
@@ -378,7 +381,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             n_simulations=self.number_of_simulations,
             start_time=time(),
         )
-        self.__capture_root_state(random_seed)
         try:
             while sim_monitor.keep_simulating():
                 sim_idx = sim_monitor.increment() - 1
@@ -409,17 +411,19 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f.write(inputs_json)
             raise error
 
-    def __run_in_parallel(self, n_workers=None, random_seed=None):
+    def __run_in_parallel(self, n_workers=None):
         """
         Runs the monte carlo simulation in parallel.
+
+        The root seed state is captured by ``simulate`` before this runs and
+        travels with the pickled instance, so every worker derives the same
+        per-index child seed from ``self.__root_state``.
 
         Parameters
         ----------
         n_workers: int, optional
             Number of workers to be used. If None, the number of workers
             will be equal to the number of CPUs available. Default is None.
-        random_seed : int or SeedSequence, optional
-            Root seed for the run. See ``simulate``.
 
         Returns
         -------
@@ -447,8 +451,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             # the sampled inputs do not depend on the number of workers. The
             # root state is small and travels with the pickled instance, so no
             # per-index seed list is materialized or sent to each process.
-            self.__capture_root_state(random_seed)
-
             for _ in range(n_workers):
                 sim_producer = multiprocess.Process(
                     target=self.__sim_producer,
@@ -1725,26 +1727,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             If no error data is available to export.
         """
         self._write_log_to_json(self.errors_log, filename)
-
-
-def _seed_sequence_to_int(seed_sequence):
-    """Collapse a ``SeedSequence`` into a 128-bit Python ``int``.
-
-    A plain ``int`` is the one seed type accepted alike by
-    ``numpy.random.default_rng``, ``numpy.random.RandomState`` and the stdlib
-    ``random.Random`` (which rejects a ``SeedSequence`` with a ``TypeError``
-    since Python 3.11), so a custom sampler whose ``reset_seed`` documents an
-    ``int`` keeps working. All four ``uint32`` words are combined to keep the
-    full 128-bit pool, so the environment/rocket/flight sub-streams stay
-    decorrelated instead of collapsing to a single 32-bit word.
-
-    The words are combined by value (little-endian word order), not via
-    ``tobytes()``, so the seed is the same on big- and little-endian machines
-    -- a byte-order-dependent seed would break the cross-platform
-    reproducibility this whole scheme exists to provide.
-    """
-    words = seed_sequence.generate_state(4, dtype=np.uint32)
-    return sum(int(word) << (32 * position) for position, word in enumerate(words))
 
 
 def _claim_next_index(sim_monitor, mutex):

@@ -150,6 +150,36 @@ def _simulate_inputs(
     return _read_inputs_by_index(montecarlo.input_file)
 
 
+def test_invalid_seed_does_not_truncate_existing_output(
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto_numpy_only,
+    stochastic_flight,
+):
+    """A rejected seed must fail before any output file is truncated, so passing
+    an invalid seed cannot destroy the results of a previous run."""
+    monkeypatch.setattr(mc_module, "Flight", _StubFlight)
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "keep"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto_numpy_only,
+        flight=stochastic_flight,
+    )
+    with open(montecarlo.input_file, "w", encoding="utf-8") as existing:
+        existing.write("previous results\n")
+
+    # A Generator is not a seed and is rejected; the run must raise before the
+    # ``w+`` file setup truncates anything.
+    with pytest.raises(TypeError):
+        montecarlo.simulate(
+            number_of_simulations=3, random_seed=np.random.default_rng(0)
+        )
+
+    with open(montecarlo.input_file, encoding="utf-8") as kept:
+        assert kept.read() == "previous results\n"
+
+
 def test_serial_inputs_are_reproducible(
     monkeypatch,
     tmp_path,
