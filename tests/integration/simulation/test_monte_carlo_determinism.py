@@ -14,20 +14,51 @@ Stubbing the module-level ``Flight`` symbol reaches the parallel workers only
 under the ``fork`` start method, so the worker-invariance test skips otherwise and
 is marked ``slow`` to match the other Monte Carlo multiprocessing tests.
 
-A dedicated numpy-only rocket is used so *all* randomness flows through the seeded
-numpy generator. List-valued stochastic attributes are sampled with the standard
-library ``random.choice`` (an unseeded global generator) which ``random_seed``
-does not govern; the fixture drops the only such attribute (a multi-element
-``thrust_source``) so the inputs are byte-for-byte reproducible from the seed.
+A dedicated numpy-only rocket keeps the fork-based end-to-end test simple: it
+gives the motor a single ``thrust_source`` so the run has no list-valued attribute
+at all. List sampling is itself seeded now (it draws through the model generator,
+not the stdlib ``random.choice``) and is covered directly in
+``tests/unit/stochastic/test_stochastic_model``.
+
+Seed derivation being independent of the multiprocessing start method (fork,
+spawn or forkserver) is verified separately by
+``test_seed_derivation_is_start_method_invariant``, which uses a top-level
+picklable target so it is safe under ``spawn``/``forkserver`` -- unlike the
+``Flight``-stub test above, which reaches workers only under ``fork``.
 """
 
 import json
+import multiprocessing
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import rocketpy.simulation.monte_carlo as mc_module
 from rocketpy.simulation import MonteCarlo
+from rocketpy.simulation.monte_carlo import _seed_sequence_to_int
 from rocketpy.stochastic import StochasticRocket, StochasticSolidMotor
+
+_child_seed = MonteCarlo._MonteCarlo__child_seed
+
+
+def _available_start_methods():
+    """The multiprocessing start methods this platform actually supports."""
+    supported = multiprocessing.get_all_start_methods()
+    return [method for method in ("fork", "spawn", "forkserver") if method in supported]
+
+
+def _derive_index_seeds(root_state, indices):
+    """Derive the per-index seed fingerprints from ``root_state``.
+
+    Top-level and picklable (only a small tuple and a list of ints cross the
+    process boundary), so it runs unchanged under every start method -- including
+    ``spawn``/``forkserver``, which re-import this module rather than inheriting
+    the parent's memory. It calls the real production helpers (``__child_seed``
+    and ``_seed_sequence_to_int``) so the test tracks the shipped derivation.
+    """
+    plan = SimpleNamespace(_MonteCarlo__root_state=root_state)
+    return {index: _seed_sequence_to_int(_child_seed(plan, index)) for index in indices}
 
 
 class _StubFlight:
@@ -175,3 +206,39 @@ def test_inputs_are_worker_invariant(
     for index in expected:
         assert serial[index] == par2[index], f"serial vs parallel(2) differ at {index}"
         assert serial[index] == par4[index], f"serial vs parallel(4) differ at {index}"
+
+
+@pytest.mark.parametrize("start_method", _available_start_methods())
+def test_seed_derivation_is_start_method_invariant(start_method):
+    """Per-index seeds derived in a worker match the main process under every
+    available start method (fork, spawn, forkserver).
+
+    The full worker-invariance test above stubs the module-level ``Flight`` and so
+    only reaches workers under ``fork``. This one instead checks the property that
+    actually has to hold cross-platform -- that a simulation index maps to the same
+    seed no matter which process derives it -- using a top-level picklable target
+    and small picklable arguments, so it is valid under ``spawn``/``forkserver``
+    (Python 3.14's POSIX default) without relying on any inherited parent state.
+    Two workers split the indices; their combined result must equal the
+    single-process derivation.
+    """
+    root = np.random.SeedSequence(2718281828)
+    root_state = (
+        root.entropy,
+        root.spawn_key,
+        root.pool_size,
+        root.n_children_spawned,
+    )
+    indices = list(range(6))
+    expected = _derive_index_seeds(root_state, indices)
+
+    context = multiprocessing.get_context(start_method)
+    chunks = [(root_state, indices[0::2]), (root_state, indices[1::2])]
+    with context.Pool(2) as pool:
+        results = pool.starmap(_derive_index_seeds, chunks)
+
+    combined = {}
+    for result in results:
+        combined.update(result)
+    assert combined == expected
+    assert sorted(combined) == indices
