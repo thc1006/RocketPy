@@ -122,7 +122,29 @@ class StochasticModel:
         self.obj = obj
         self.last_rnd_dict = {}
         self.__stochastic_dict = kwargs
+        self.__nominal_values = {}
         self._set_stochastic(seed)
+
+    def _nominal(self, input_name, getter=getattr):
+        """``self.obj``'s value for ``input_name``, as it was when this model
+        was built.
+
+        Read once and remembered, because ``StochasticEnvironment`` has
+        ``create_object`` write the randomised value back onto ``self.obj``
+        instead of building a copy. Re-reading it on a reseed would take one
+        simulation's output as the next one's nominal, and a factor would
+        multiply the factor before it rather than the original value.
+
+        A custom ``getter`` reads a component's own attribute rather than one
+        of ``self.obj``'s, and nothing writes back to those, so it is passed
+        straight through. Caching it here would be wrong as well: every
+        component's position arrives under the one name ``"position"``.
+        """
+        if getter is not getattr:
+            return getter(self.obj, input_name)
+        if input_name not in self.__nominal_values:
+            self.__nominal_values[input_name] = getattr(self.obj, input_name)
+        return self.__nominal_values[input_name]
 
     def _set_stochastic(self, seed=None):
         """Set the stochastic attributes from the input dictionary.
@@ -170,7 +192,7 @@ class StochasticModel:
                                 "or a custom sampler"
                             )
                 else:
-                    attr_value = [getattr(self.obj, input_name)]
+                    attr_value = [self._nominal(input_name)]
                 setattr(self, input_name, attr_value)
 
     def __repr__(self):
@@ -305,7 +327,7 @@ class StochasticModel:
             # object passed.
             dist_func = get_distribution(input_value[1], self.__random_number_generator)
             return (
-                self._nominal_value(input_name, getattr(self.obj, input_name)),
+                self._nominal_value(input_name, self._nominal(input_name, getattr)),
                 input_value[0],
                 dist_func,
             )
@@ -381,7 +403,7 @@ class StochasticModel:
             If the input is not in a valid format.
         """
         if not input_value:
-            return [getattr(self.obj, input_name)]
+            return [self._nominal(input_name, getattr)]
         else:
             return input_value
 
@@ -407,7 +429,7 @@ class StochasticModel:
                 distribution function).
         """
         return (
-            self._nominal_value(input_name, getattr(self.obj, input_name)),
+            self._nominal_value(input_name, self._nominal(input_name, getattr)),
             input_value,
             get_distribution("normal", self.__random_number_generator),
         )
@@ -434,7 +456,7 @@ class StochasticModel:
             If the input is not in a valid format.
         """
         attribute_name = input_name.replace("_factor", "")
-        setattr(self, f"_{attribute_name}", getattr(self.obj, attribute_name))
+        setattr(self, f"_{attribute_name}", self._nominal(attribute_name))
 
         if isinstance(input_value, tuple):
             return self._validate_tuple_factor(input_name, input_value)

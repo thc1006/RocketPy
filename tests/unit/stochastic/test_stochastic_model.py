@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from rocketpy.stochastic import StochasticFreeFormFins
+from rocketpy import Environment
+from rocketpy.stochastic import StochasticEnvironment
 from rocketpy.stochastic.stochastic_model import StochasticModel
 
 
@@ -82,3 +84,72 @@ def test_list_choices_are_reproducible(calisto_free_form_fins):
     # Both candidates must stay reachable, or the assertions above would also
     # hold for a generator that always returned the same one.
     assert set(spans(7)) == {0.1, 0.12}
+
+
+def _effective_wind_x(environment):
+    """The wind the Environment would actually fly with."""
+    wind = environment.wind_velocity_x
+    return float(wind(0)) if callable(wind) else float(wind)
+
+
+def test_reseeding_does_not_take_the_last_run_as_the_next_nominal():
+    """Reseeding with the same seed has to give the same inputs.
+
+    ``StochasticEnvironment.create_object`` writes the randomised value back
+    onto the Environment rather than building a copy, so re-reading the nominal
+    from it on the next reseed compounded: 10 -> 8.576 -> 7.355 -> 6.308, each
+    one the last multiplied by the same factor again.
+    """
+    environment = Environment()
+    environment.set_atmospheric_model(type="standard_atmosphere")
+    environment.wind_velocity_x = 10.0
+    stochastic = StochasticEnvironment(
+        environment=environment, wind_velocity_x_factor=(1.0, 0.1)
+    )
+
+    winds = []
+    for _ in range(4):
+        stochastic._set_stochastic(12345)
+        winds.append(_effective_wind_x(stochastic.create_object()))
+
+    assert len(set(winds)) == 1, f"the same seed drifted across reseeds: {winds}"
+
+
+def test_a_simulation_index_does_not_depend_on_the_indices_before_it():
+    """What the per-index seeding claims: index i gets the same inputs however
+    it is reached. Running 0, 1, 2 in order has to match running 2 on its own,
+    which is what a worker that happens to pick up index 2 first would do.
+    """
+
+    def wind_for(seeds):
+        environment = Environment()
+        environment.set_atmospheric_model(type="standard_atmosphere")
+        environment.wind_velocity_x = 10.0
+        stochastic = StochasticEnvironment(
+            environment=environment, wind_velocity_x_factor=(1.0, 0.1)
+        )
+        wind = None
+        for seed in seeds:
+            stochastic._set_stochastic(seed)
+            wind = _effective_wind_x(stochastic.create_object())
+        return wind
+
+    assert wind_for([101, 102, 103]) == wind_for([103])
+
+
+def test_a_scalar_nominal_does_not_drift_across_reseeds():
+    """Not only the factors. ``_validate_scalar`` and the ``(std, "distribution")``
+    tuple both take their nominal from the object, and ``create_object`` writes
+    the drawn value back onto that same object, so a plain scalar spec drifts
+    the same way a factor compounds.
+    """
+    environment = Environment()
+    environment.set_atmospheric_model(type="standard_atmosphere")
+    stochastic = StochasticEnvironment(environment=environment, elevation=100.0)
+
+    elevations = []
+    for _ in range(4):
+        stochastic._set_stochastic(2024)
+        elevations.append(float(stochastic.create_object().elevation))
+
+    assert len(set(elevations)) == 1, f"the nominal elevation drifted: {elevations}"
