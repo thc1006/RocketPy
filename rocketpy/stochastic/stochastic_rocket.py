@@ -158,6 +158,13 @@ class StochasticRocket(StochasticModel):
         self.air_brakes = []
         self.parachutes = []
         self.__components_map = {}
+        # Raw eccentricity arguments, kept as the caller gave them.
+        # ``add_cp_eccentricity`` and ``add_thrust_eccentricity`` run after
+        # ``__init__``, so their values are not in the dict the base class
+        # re-validates on a reseed. Validating them once would leave the
+        # distribution bound to the Generator of whichever simulation happened
+        # to come first, so the raw form is kept and validated again each time.
+        self.__eccentricity_specs = {}
         super().__init__(
             obj=rocket,
             radius=radius,
@@ -176,16 +183,31 @@ class StochasticRocket(StochasticModel):
             coordinate_system_orientation=None,
         )
 
+    # Every collection of nested stochastic objects, in the order their child
+    # seeds are spawned. Listed here rather than written out inline so that a
+    # component type cannot end up in ``create_object`` and not in the reseed:
+    # air brakes were, and their sampling depended on which worker ran the
+    # index instead of on the index. ``_stochastic_collections`` is asserted
+    # against the rocket's own attributes in the tests.
+    _POSITIONED_COLLECTIONS = ("aerodynamic_surfaces", "motors", "rail_buttons")
+    _PLAIN_COLLECTIONS = ("parachutes", "air_brakes")
+
+    @classmethod
+    def _stochastic_collections(cls):
+        """The names of every attribute holding nested stochastic objects."""
+        return cls._POSITIONED_COLLECTIONS + cls._PLAIN_COLLECTIONS
+
     def _set_stochastic(self, seed=None):
         """Set the stochastic attributes for Components, positions and
         inputs.
 
         Every nested component -- the rocket body, each aerodynamic surface,
-        motor, rail button and parachute -- is reseeded from its own child of a
-        ``SeedSequence`` root, so components that sample the same distribution do
-        not draw identical values (a main and a drogue parachute get independent
-        ``cd_s`` and ``lag`` samples, not the same one). Children are spawned in a
-        fixed order, so the result stays reproducible under ``random_seed``.
+        motor, rail button, parachute and air brake -- is reseeded from its own
+        child of a ``SeedSequence`` root, so components that sample the same
+        distribution do not draw identical values (a main and a drogue parachute
+        get independent ``cd_s`` and ``lag`` samples, not the same one). Children
+        are spawned in a fixed order, so the result stays reproducible under
+        ``random_seed``.
 
         Parameters
         ----------
@@ -194,13 +216,12 @@ class StochasticRocket(StochasticModel):
         """
         root = np.random.SeedSequence(seed)
         super()._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
-        self.aerodynamic_surfaces = self.__reset_components(
-            self.aerodynamic_surfaces, root
-        )
-        self.motors = self.__reset_components(self.motors, root)
-        self.rail_buttons = self.__reset_components(self.rail_buttons, root)
-        for parachute in self.parachutes:
-            parachute._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
+        self.__apply_eccentricity_specs()
+        for name in self._POSITIONED_COLLECTIONS:
+            setattr(self, name, self.__reset_components(getattr(self, name), root))
+        for name in self._PLAIN_COLLECTIONS:
+            for child in getattr(self, name):
+                child._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
 
     def __reset_components(self, components, root):
         """Creates a new Components whose stochastic structures
@@ -468,8 +489,9 @@ class StochasticRocket(StochasticModel):
         self : StochasticRocket
             Object of the StochasticRocket class.
         """
-        self.cp_eccentricity_x = self._validate_eccentricity("cp_eccentricity_x", x)
-        self.cp_eccentricity_y = self._validate_eccentricity("cp_eccentricity_y", y)
+        self.__eccentricity_specs["cp_eccentricity_x"] = x
+        self.__eccentricity_specs["cp_eccentricity_y"] = y
+        self.__apply_eccentricity_specs()
         return self
 
     def add_thrust_eccentricity(self, x=None, y=None):
@@ -494,13 +516,23 @@ class StochasticRocket(StochasticModel):
         self : StochasticRocket
             Object of the StochasticRocket class.
         """
-        self.thrust_eccentricity_x = self._validate_eccentricity(
-            "thrust_eccentricity_x", x
-        )
-        self.thrust_eccentricity_y = self._validate_eccentricity(
-            "thrust_eccentricity_y", y
-        )
+        self.__eccentricity_specs["thrust_eccentricity_x"] = x
+        self.__eccentricity_specs["thrust_eccentricity_y"] = y
+        self.__apply_eccentricity_specs()
         return self
+
+    def __apply_eccentricity_specs(self):
+        """Re-validate the eccentricities against the current Generator.
+
+        Validation stores a distribution as a method bound to the Generator
+        that was live at the time, so a tuple validated once keeps sampling
+        from that one. Re-running it after every reseed is what ties the draw
+        to the simulation index rather than to whichever index the worker
+        happened to run first. ``get_distribution`` only binds a method, so
+        this consumes no randomness and does not shift any other draw.
+        """
+        for name, spec in self.__eccentricity_specs.items():
+            setattr(self, name, self._validate_eccentricity(name, spec))
 
     def _validate_eccentricity(self, eccentricity, position):
         """Validate the eccentricity argument.
