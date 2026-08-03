@@ -29,15 +29,22 @@ picklable target so it is safe under ``spawn``/``forkserver`` -- unlike the
 
 import json
 import multiprocessing
+import os
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import rocketpy.simulation.monte_carlo as mc_module
+from rocketpy import Environment
 from rocketpy.simulation import MonteCarlo
 from rocketpy.simulation.monte_carlo import _seed_sequence_to_int
-from rocketpy.stochastic import StochasticRocket, StochasticSolidMotor
+from rocketpy.stochastic import (
+    StochasticAirBrakes,
+    StochasticEnvironment,
+    StochasticRocket,
+    StochasticSolidMotor,
+)
 
 _child_seed = MonteCarlo._MonteCarlo__child_seed
 
@@ -133,6 +140,18 @@ def _read_inputs_by_index(input_file):
                 continue
             by_index[json.loads(line)["index"]] = line
     return by_index
+
+
+def _count_rows(log_file):
+    """How many records were written, before anything is keyed by index.
+
+    Keying by index hides a duplicate: two workers claiming the same index
+    write two rows and the second overwrites the first in the dict, so the
+    result looks complete. The claim is meant to be atomic, and the count is
+    what says so.
+    """
+    with open(log_file, mode="r", encoding="utf-8") as rows:
+        return sum(1 for line in rows if line.strip())
 
 
 def _simulate_inputs(
@@ -272,3 +291,421 @@ def test_seed_derivation_is_start_method_invariant(start_method):
         combined.update(result)
     assert combined == expected
     assert sorted(combined) == indices
+
+
+def _assert_the_same_environment_was_flown(runs, expected_indices, start_method):
+    """Every worker count flew index i with the same effective environment.
+
+    This is the half the inputs file cannot show. It records
+    ``wind_velocity_x_factor``, which is the same for index i however the run
+    was executed even when the baseline it multiplies has drifted from one
+    simulation to the next.
+    """
+    effective = {
+        label: _read_inputs_by_index(montecarlo.output_file)
+        for label, (montecarlo, _inputs) in runs.items()
+    }
+    for label, by_index in effective.items():
+        assert sorted(by_index) == expected_indices, f"{label}: outputs are incomplete"
+
+    for index in expected_indices:
+        reference = json.loads(effective["serial"][index])
+        for key in _EFFECTIVE_ENVIRONMENT:
+            assert key in reference, f"{key} was not recorded"
+        assert reference["effective_wind_x"] != 0.0, (
+            "the wind baseline is zero, so a compounding baseline cannot show"
+        )
+        for label in ("parallel-2", "parallel-4"):
+            drawn = json.loads(effective[label][index])
+            for key in _EFFECTIVE_ENVIRONMENT:
+                assert drawn[key] == reference[key], (
+                    f"{start_method}: {label} flew a different {key} at index "
+                    f"{index}: {drawn[key]} against {reference[key]}"
+                )
+
+
+def _assert_the_run_is_complete(label, montecarlo, inputs, count):
+    """Every index written once, to both files, with nothing in the error log.
+
+    The row counts are taken before anything is keyed by index: two workers
+    claiming the same index write two rows, and the second overwrites the first
+    in the dict, so a duplicate looks like a complete run.
+    """
+    expected_indices = list(range(count))
+    rows = _count_rows(montecarlo.input_file)
+
+    assert sorted(inputs) == expected_indices, (
+        f"{label}: indices {sorted(inputs)}, expected {expected_indices}"
+    )
+    assert rows == count, (
+        f"{label}: {rows} rows for {count} simulations, so an index was claimed "
+        f"more than once"
+    )
+    assert _count_rows(montecarlo.output_file) == count, (
+        f"{label}: the output rows do not match the simulations run"
+    )
+    assert sorted(_read_inputs_by_index(montecarlo.output_file)) == expected_indices, (
+        f"{label}: the outputs do not match the inputs"
+    )
+    assert not os.path.getsize(montecarlo.error_file), (
+        f"{label}: the run wrote to its error file"
+    )
+
+
+@pytest.fixture
+def stochastic_environment_with_wind(example_spaceport_env):
+    """A stochastic environment whose wind is not zero.
+
+    The shared ``stochastic_environment`` fixture sits on an Environment whose
+    ``wind_velocity_x`` is 0 at every altitude, and zero times any factor is
+    zero, so a baseline that compounds from one simulation to the next cannot
+    show up in it at all. Measured: with the baseline fix reverted, every
+    assertion in this file still passed. A wind that is actually blowing is
+    what makes the property testable.
+    """
+    environment = Environment(
+        latitude=example_spaceport_env.latitude,
+        longitude=example_spaceport_env.longitude,
+        elevation=example_spaceport_env.elevation,
+    )
+    environment.set_atmospheric_model(
+        type="custom_atmosphere", wind_u=12.0, wind_v=-7.0
+    )
+    return StochasticEnvironment(
+        environment=environment,
+        elevation=(1400, 10, "normal"),
+        wind_velocity_x_factor=(1.0, 0.05, "normal"),
+        wind_velocity_y_factor=(1.0, 0.05, "normal"),
+    )
+
+
+def _wind_x(flight):
+    """The wind the simulation actually flew with, not the factor drawn for it."""
+    return float(flight.env.wind_velocity_x(0))
+
+
+def _wind_y(flight):
+    return float(flight.env.wind_velocity_y(0))
+
+
+def _elevation(flight):
+    return float(flight.env.elevation)
+
+
+_EFFECTIVE_ENVIRONMENT = {
+    "effective_wind_x": _wind_x,
+    "effective_wind_y": _wind_y,
+    "effective_elevation": _elevation,
+}
+
+
+def _sampled_only(record):
+    """The recorded inputs with object identity stripped out.
+
+    A ``Function``'s ``signature.hash`` and its serialised ``source`` encode the
+    object, not the value drawn for it, and an object built in another process
+    has a different one. Under ``fork`` they happen to agree because the child
+    inherits the parent's objects; under ``spawn`` and ``forkserver`` they
+    cannot. Measured on a real run: six fields differ across the boundary and
+    all six are these, while every sampled quantity matches exactly.
+    """
+    flat = {}
+
+    def walk(value, path=""):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            for position, item in enumerate(value):
+                walk(item, f"{path}[{position}]")
+        else:
+            flat[path] = value
+
+    walk(record)
+    return {
+        key: value
+        for key, value in flat.items()
+        if "signature" not in key and not key.endswith(".source")
+    }
+
+
+def _real_run_inputs(tmp_path, environment, rocket, flight, tag, **simulate_kwargs):
+    """Run a real Monte Carlo, no stub, and return the inputs keyed by index.
+
+    Deliberately without the ``Flight`` stub. Stubbing is what confines the test
+    above to ``fork``: it replaces a module-level symbol in the parent, and a
+    ``spawn`` or ``forkserver`` child re-imports the module instead of inheriting
+    it. A real run has nothing that needs to cross the boundary except the
+    pickled MonteCarlo, which is the thing worth testing.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / tag),
+        environment=environment,
+        rocket=rocket,
+        flight=flight,
+        data_collector=_EFFECTIVE_ENVIRONMENT,
+    )
+    montecarlo.simulate(**simulate_kwargs)
+    return montecarlo, _read_inputs_by_index(montecarlo.input_file)
+
+
+@pytest.fixture
+def restore_start_method():
+    """Set the start method for one test and put it back afterwards."""
+    multiprocess = pytest.importorskip("multiprocess")
+    original = multiprocess.get_start_method()
+    yield multiprocess
+    multiprocess.set_start_method(original, force=True)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("start_method", _available_start_methods())
+def test_the_real_parallel_path_is_worker_invariant_under_every_start_method(
+    restore_start_method,
+    tmp_path,
+    stochastic_environment_with_wind,
+    stochastic_calisto_numpy_only,
+    stochastic_flight,
+    calisto_air_brakes_clamp_on,
+    start_method,
+):
+    """The whole parallel path, not just the seed arithmetic.
+
+    ``test_seed_derivation_is_start_method_invariant`` covers the derivation on
+    every start method, and the stubbed test above covers the real loop on
+    ``fork``. Neither covers ``multiprocess.Process``, ``__sim_producer``, the
+    manager proxies or pickling the stochastic object graph anywhere but
+    ``fork``, and that is what Windows, macOS and Python 3.14's POSIX default
+    actually run.
+    """
+    multiprocess = restore_start_method
+    if start_method not in multiprocess.get_all_start_methods():
+        pytest.skip(f"{start_method} is not available here")
+    multiprocess.set_start_method(start_method, force=True)
+
+    # Air brakes and eccentricity are sampled by their own code paths, and each
+    # one was reseeded from somewhere other than the simulation index.
+    stochastic_calisto_numpy_only.add_air_brakes(
+        StochasticAirBrakes(
+            air_brakes=calisto_air_brakes_clamp_on.air_brakes[0],
+            drag_coefficient_curve_factor=(1.0, 0.1),
+        ),
+        calisto_air_brakes_clamp_on._controllers[0],
+    )
+    stochastic_calisto_numpy_only.add_cp_eccentricity(x=(0.0, 0.001, "normal"), y=0.001)
+    stochastic_calisto_numpy_only.add_thrust_eccentricity(
+        x=(0.0, 0.001, "normal"), y=0.001
+    )
+
+    count = 4
+    common = {"number_of_simulations": count, "random_seed": 987654321}
+    models = (
+        stochastic_environment_with_wind,
+        stochastic_calisto_numpy_only,
+        stochastic_flight,
+    )
+    runs = {
+        "serial": _real_run_inputs(
+            tmp_path, *models, f"{start_method}-serial", **common
+        ),
+        "parallel-2": _real_run_inputs(
+            tmp_path,
+            *models,
+            f"{start_method}-p2",
+            parallel=True,
+            n_workers=2,
+            **common,
+        ),
+        "parallel-4": _real_run_inputs(
+            tmp_path,
+            *models,
+            f"{start_method}-p4",
+            parallel=True,
+            n_workers=4,
+            **common,
+        ),
+    }
+
+    expected_indices = list(range(count))
+    for label, (montecarlo, inputs) in runs.items():
+        _assert_the_run_is_complete(label, montecarlo, inputs, count)
+
+    _assert_the_same_environment_was_flown(runs, expected_indices, start_method)
+
+    serial = runs["serial"][1]
+    for label in ("parallel-2", "parallel-4"):
+        for index in expected_indices:
+            expected = _sampled_only(json.loads(serial[index]))
+            actual = _sampled_only(json.loads(runs[label][1][index]))
+
+            # Or stripping identity could quietly empty the comparison.
+            assert len(expected) > 20, f"only {len(expected)} fields left to compare"
+            assert sum("eccentricity" in key for key in expected) == 4, (
+                "the four eccentricities are not among the compared fields"
+            )
+            assert sum("brake" in key for key in expected) >= 1, (
+                "the air brake is not among the compared fields"
+            )
+            assert actual == expected, (
+                f"{start_method}: serial and {label} differ at index {index} in "
+                f"{sorted(k for k in set(expected) | set(actual) if expected.get(k) != actual.get(k))}"
+            )
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+def test_a_missing_simulation_is_not_reported_as_a_successful_run(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+):
+    """A run that wrote fewer records than it claimed has to fail.
+
+    Neither file shows this on its own: every row is well formed, and reading
+    them back keyed by index cannot tell four rows from three plus a duplicate.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / f"short-{parallel}"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    kwargs = {"parallel": True, "n_workers": 2} if parallel else {}
+
+    # Lose one simulation's inputs the way a worker dying between claiming and
+    # writing does. Driven through ``simulate`` rather than by calling the check
+    # afterwards, so this also proves the check is reached at all.
+    real = montecarlo._MonteCarlo__evaluate_flight_inputs
+
+    def drop_the_second(sim_idx):
+        return "" if sim_idx == 1 else real(sim_idx)
+
+    montecarlo._MonteCarlo__evaluate_flight_inputs = drop_the_second
+
+    with pytest.raises(RuntimeError, match="never written"):
+        montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+def test_a_simulation_whose_outputs_went_missing_also_fails(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+):
+    """The other file. A worker that wrote its inputs and stopped before its
+    outputs leaves the two logs disagreeing, and a check that only reads the
+    inputs sees a complete run.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / f"no-output-{parallel}"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    kwargs = {"parallel": True, "n_workers": 2} if parallel else {}
+    real = montecarlo._MonteCarlo__evaluate_flight_outputs
+
+    def drop_the_second(flight, sim_idx):
+        return "" if sim_idx == 1 else real(flight, sim_idx)
+
+    montecarlo._MonteCarlo__evaluate_flight_outputs = drop_the_second
+
+    with pytest.raises(RuntimeError, match="never written"):
+        montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+):
+    """A worker killed part way through a write leaves a truncated row.
+
+    That is the case the check exists to diagnose, so it has to name the
+    simulation that went missing. Parsing the file strictly turned it into a
+    JSONDecodeError out of ``simulate`` instead, which points nowhere.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / f"truncated-{parallel}"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    kwargs = {"parallel": True, "n_workers": 2} if parallel else {}
+    real = montecarlo._MonteCarlo__evaluate_flight_inputs
+
+    def cut_the_second_short(sim_idx):
+        row = real(sim_idx)
+        if sim_idx != 1:
+            return row
+        half = row[: len(row) // 2] + "\n"
+        with pytest.raises(ValueError):
+            json.loads(half)  # the row has to be unparseable for this to test it
+        return half
+
+    montecarlo._MonteCarlo__evaluate_flight_inputs = cut_the_second_short
+
+    with pytest.raises(RuntimeError, match="never written"):
+        montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
+
+
+def test_a_run_stopped_with_ctrl_c_keeps_what_it_saved(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+):
+    """Ctrl-C is a stop, not a fault.
+
+    The run path catches it, prints that the files are saved and returns. The
+    completeness check then counted the simulations that never ran and called
+    the run a failure, contradicting the message printed a moment earlier.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "interrupted"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    real = montecarlo._MonteCarlo__run_single_simulation
+    finished = []
+
+    def stop_after_the_first():
+        if finished:
+            raise KeyboardInterrupt("user pressed ctrl-c")
+        finished.append(1)
+        return real()
+
+    montecarlo._MonteCarlo__run_single_simulation = stop_after_the_first
+
+    montecarlo.simulate(number_of_simulations=3, random_seed=42)
+
+    # Short of the three asked for, so the check really was in a position to
+    # reject this run, and the one simulation that did finish is still there.
+    assert _count_rows(montecarlo.input_file) == 1
+
+
+def test_appending_checks_only_the_simulations_the_run_added(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+):
+    """``append=True`` leaves the earlier run's records in the same files, and
+    ``number_of_simulations`` is the total to reach rather than a count to add.
+    The check has to look at indices ``_initial_sim_idx`` upwards, or a second
+    run would be judged against records it never wrote.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "appended"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    montecarlo.simulate(number_of_simulations=2, random_seed=606)
+
+    assert _count_rows(montecarlo.input_file) == 2
+
+    # Take the first run's records away before appending. The second run is
+    # judged on what it wrote, so a check counting the whole file would call
+    # this incomplete even though nothing went wrong.
+    montecarlo.input_file.write_text("", encoding="utf-8")
+    montecarlo.output_file.write_text("", encoding="utf-8")
+
+    montecarlo.simulate(number_of_simulations=4, append=True, random_seed=606)
+
+    assert montecarlo._initial_sim_idx == 2, (
+        "the second run should have started where the first stopped"
+    )
+    written = _read_inputs_by_index(montecarlo.input_file)
+    assert sorted(written) == [2, 3], (
+        f"the appended run wrote the wrong indices: {sorted(written)}"
+    )
