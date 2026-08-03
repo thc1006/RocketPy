@@ -242,6 +242,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
+        # Both run paths catch Ctrl-C, save what they have and return, so a
+        # stopped run is incomplete on purpose and the completeness check below
+        # has to know the difference between that and a worker going missing.
+        self._interrupted = False
 
         # Capture the small, picklable root seed state once per run (every
         # simulation index derives its child seed from it, see __child_seed).
@@ -259,6 +263,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         else:
             self.__run_in_serial()
 
+        self.__check_each_index_was_recorded_once()
         self.__terminate_simulation()
 
     def __setup_files(self, append):
@@ -365,7 +370,61 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self.rocket._set_stochastic(_seed_sequence_to_int(rocket_seed))
         self.flight._set_stochastic(_seed_sequence_to_int(flight_seed))
 
-    def __run_in_serial(self):  # pylint: disable=too-many-statements
+    def __check_each_index_was_recorded_once(self):
+        """Every index this run claimed left exactly one input and one output row.
+
+        The counter hands each index out once, so a missing one means a worker
+        stopped between claiming and writing, and a repeated one means two
+        claimed the same index. Neither is visible in the files themselves: the
+        rows look well formed, and reading them back keyed by index hides the
+        duplicate behind the row that overwrote it. Both make the results wrong
+        while the run reports success, which is the thing per-index seeding is
+        supposed to rule out.
+
+        Only over the range this run produced. ``append=True`` leaves earlier
+        runs in the same files, and ``number_of_simulations`` is the total to
+        reach rather than a count to add, so the new indices are
+        ``_initial_sim_idx`` up to it.
+
+        A run stopped with Ctrl-C is exempt: both run paths catch it, keep what
+        they have and return, so being short is the point rather than a fault.
+        """
+        expected = set(range(self._initial_sim_idx, self.number_of_simulations))
+        if not expected or self._interrupted:
+            # A stopped run is short by definition and already said so. Checking
+            # it anyway contradicted the "Files saved." it had just printed.
+            return
+
+        for label, path in (
+            ("inputs", self.input_file),
+            ("outputs", self.output_file),
+        ):
+            written = {}
+            with open(path, mode="r", encoding="utf-8") as rows:
+                for line in rows:
+                    line = line.strip()
+                    if line:
+                        try:
+                            index = json.loads(line).get("index")
+                        except ValueError:
+                            # A worker killed mid-write leaves a partial row.
+                            # Skipping it reports that index as missing, which
+                            # is what happened, rather than failing to parse.
+                            continue
+                        written[index] = written.get(index, 0) + 1
+
+            missing = sorted(expected - set(written))
+            repeated = sorted(index for index in expected if written.get(index, 0) > 1)
+            if missing or repeated:
+                raise RuntimeError(
+                    f"the {label} file does not match the simulations that ran: "
+                    f"{len(missing)} never written {missing[:5]}, "
+                    f"{len(repeated)} written more than once {repeated[:5]}. "
+                    f"The results are incomplete, so they are not reported as a "
+                    f"successful run."
+                )
+
+    def __run_in_serial(self):
         """
         Runs the monte carlo simulation in serial mode.
 
@@ -401,15 +460,19 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             sim_monitor.print_final_status()
 
         except KeyboardInterrupt:
+            self._interrupted = True
             print("Keyboard interrupt received. Files saved.")
-            with open(self._error_file, "a", encoding="utf-8") as f:
-                f.write(inputs_json)
+            self.__keep_the_inputs_that_did_not_finish(inputs_json)
 
         except Exception as error:
             print(f"Error on iteration {sim_monitor.count}: {error}")
-            with open(self._error_file, "a", encoding="utf-8") as f:
-                f.write(inputs_json)
+            self.__keep_the_inputs_that_did_not_finish(inputs_json)
             raise error
+
+    def __keep_the_inputs_that_did_not_finish(self, inputs_json):
+        """Append the inputs of a simulation that stopped part way through."""
+        with open(self._error_file, "a", encoding="utf-8") as f:
+            f.write(inputs_json)
 
     def __run_in_parallel(self, n_workers=None):
         """
@@ -444,36 +507,35 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 start_time=time(),
             )
 
-            processes = []
-            # Each worker derives one independent child seed per simulation
-            # index (not per worker) from the shared root state: the counter
-            # assigns indices and index i always seeds from __child_seed(i), so
-            # the sampled inputs do not depend on the number of workers. The
-            # root state is small and travels with the pickled instance, so no
-            # per-index seed list is materialized or sent to each process.
-            for _ in range(n_workers):
-                sim_producer = multiprocess.Process(
-                    target=self.__sim_producer,
-                    args=(
-                        sim_monitor,
-                        mutex,
-                        simulation_error_event,
-                    ),
-                )
-                processes.append(sim_producer)
-                sim_producer.start()
-
+            # Started workers only, and inside the try, so a ``start()`` that
+            # fails part way through the fleet does not leave the ones already
+            # running with nobody to clean them up.
+            started_processes = []
             try:
-                for sim_producer in processes:
+                # Each worker derives one independent child seed per simulation
+                # index (not per worker) from the shared root state: the counter
+                # assigns indices and index i always seeds from __child_seed(i),
+                # so the sampled inputs do not depend on the number of workers.
+                # The root state is small and travels with the pickled instance,
+                # so no per-index seed list is materialized or sent.
+                for _ in range(n_workers):
+                    sim_producer = multiprocess.Process(
+                        target=self.__sim_producer,
+                        args=(
+                            sim_monitor,
+                            mutex,
+                            simulation_error_event,
+                        ),
+                    )
+                    sim_producer.start()
+                    started_processes.append(sim_producer)
+
+                for sim_producer in started_processes:
                     sim_producer.join()
 
-                # Handle error from the child processes
-                if simulation_error_event.is_set():
-                    raise RuntimeError(
-                        "An error occurred during the simulation. \n"
-                        f"Check the logs and error file {self.error_file} "
-                        "for more information."
-                    )
+                _fail_if_a_worker_did_not_finish(
+                    started_processes, simulation_error_event, self.error_file
+                )
 
                 sim_monitor.print_final_status()
 
@@ -482,11 +544,14 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             except (Exception, KeyboardInterrupt) as error:
                 simulation_error_event.set()
 
-                for sim_producer in processes:
+                for sim_producer in started_processes:
                     sim_producer.join()
 
-                if not isinstance(error, KeyboardInterrupt):
+                self._interrupted = isinstance(error, KeyboardInterrupt)
+                if not self._interrupted:
                     raise error
+            finally:
+                _stop_any_worker_still_running(started_processes)
 
     def __validate_number_of_workers(self, n_workers):
         if n_workers is None or n_workers > os.cpu_count():
@@ -508,6 +573,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         error_event : multiprocess.Event
             Event signaling an error occurred during the simulation.
         """
+        # Bound before the try, not inside the loop. The handler below reports
+        # both, and a failure in the claim itself left them unassigned, so the
+        # original error was replaced by an UnboundLocalError raised out of the
+        # handler with the mutex still held.
+        sim_idx = None
+        inputs_json = ""
+        outputs_json = ""
         try:
             while True:
                 sim_idx = _claim_next_index(sim_monitor, mutex)
@@ -546,18 +618,47 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 finally:
                     mutex.release()
 
-        except Exception:  # pylint: disable=broad-except
-            mutex.acquire()
-            with open(self.error_file, "a", encoding="utf-8") as f:
-                f.write(inputs_json)
+        except Exception:
+            # Set first, so a parent waiting on the join learns why. Best effort
+            # like everything below it: this is a manager proxy, the manager may
+            # already be gone, and reporting must not replace what it reports.
+            try:
+                error_event.set()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            details = traceback.format_exc()
 
-            # See note above: must use print() to remain visible from a
-            # multiprocessing worker process.
-            _SimMonitor.reprint(
-                f"Error on iteration {sim_idx}:\n{traceback.format_exc()}"
+            # The inputs of the failed simulation when there are any, and a
+            # record of the failure itself when it happened before they were
+            # drawn. Without the second, a failure in the claim left the error
+            # file empty while the run pointed the user at it. It is a JSON
+            # line either way, because ``_read_log_file`` parses this file with
+            # ``json.loads`` and free text in it would make the log unreadable.
+            record = inputs_json or (
+                json.dumps({"index": sim_idx, "error": details}) + "\n"
             )
-            error_event.set()
-            mutex.release()
+
+            acquired = False
+            try:
+                mutex.acquire()
+                acquired = True
+                with open(self.error_file, "a", encoding="utf-8") as f:
+                    f.write(record)
+
+                # See note above: must use print() to remain visible from a
+                # multiprocessing worker process.
+                _SimMonitor.reprint(f"Error on iteration {sim_idx}:\n{details}")
+            except Exception:  # pylint: disable=broad-exception-caught
+                # The mutex or the error file is unreachable too. Reporting is
+                # not worth losing the failure that started this.
+                pass
+            finally:
+                if acquired:
+                    mutex.release()
+
+            # The worker exits non-zero, so the parent can tell a crash from a
+            # clean finish rather than only from the error event.
+            raise
 
     def __run_single_simulation(self):
         """Runs a single simulation and returns the inputs and outputs.
@@ -1499,7 +1600,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             except KeyError as e:
                 raise KeyError("No impact data found. Skipping impact ellipses.") from e
 
-        (apogee_ellipses, impact_ellipses) = generate_monte_carlo_ellipses(
+        apogee_ellipses, impact_ellipses = generate_monte_carlo_ellipses(
             impact_x,
             impact_y,
             apogee_x,
@@ -1727,6 +1828,40 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             If no error data is available to export.
         """
         self._write_log_to_json(self.errors_log, filename)
+
+
+def _stop_any_worker_still_running(started_processes):
+    """Whatever is still going here is not going to stop on its own.
+
+    The error event was set and it did not leave. Left behind, it keeps the
+    manager, the mutex and the output files alive.
+    """
+    for sim_producer in started_processes:
+        if sim_producer.is_alive():
+            sim_producer.terminate()
+            sim_producer.join()
+
+
+def _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file):
+    """Raise unless every worker finished and none of them reported an error.
+
+    A worker can die without ever setting the event: SystemExit, ``os._exit``, a
+    segfault in a native extension, a target that will not unpickle under spawn,
+    or the error handler itself failing. ``join()`` returns None whatever
+    happened, so the exit status is the only thing that separates a crash from a
+    clean finish.
+    """
+    crashed = [
+        f"{sim_producer.name} exited with {sim_producer.exitcode}"
+        for sim_producer in started_processes
+        if sim_producer.exitcode != 0
+    ]
+    if error_event.is_set() or crashed:
+        raise RuntimeError(
+            "An error occurred during the simulation. \n"
+            + (f"Workers that did not exit cleanly: {crashed}. \n" if crashed else "")
+            + f"Check the logs and error file {error_file} for more information."
+        )
 
 
 def _claim_next_index(sim_monitor, mutex):
