@@ -554,7 +554,12 @@ def test_the_real_parallel_path_is_worker_invariant_under_every_start_method(
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
 def test_a_missing_simulation_is_not_reported_as_a_successful_run(
-    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto,
+    stochastic_flight,
+    parallel,
 ):
     """A run that wrote fewer records than it claimed has to fail.
 
@@ -577,7 +582,9 @@ def test_a_missing_simulation_is_not_reported_as_a_successful_run(
     def drop_the_second(sim_idx):
         return "" if sim_idx == 1 else real(sim_idx)
 
-    montecarlo._MonteCarlo__evaluate_flight_inputs = drop_the_second
+    monkeypatch.setattr(
+        montecarlo, "_MonteCarlo__evaluate_flight_inputs", drop_the_second
+    )
 
     with pytest.raises(RuntimeError, match="never written"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
@@ -585,7 +592,12 @@ def test_a_missing_simulation_is_not_reported_as_a_successful_run(
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
 def test_a_simulation_whose_outputs_went_missing_also_fails(
-    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto,
+    stochastic_flight,
+    parallel,
 ):
     """The other file. A worker that wrote its inputs and stopped before its
     outputs leaves the two logs disagreeing, and a check that only reads the
@@ -603,7 +615,9 @@ def test_a_simulation_whose_outputs_went_missing_also_fails(
     def drop_the_second(flight, sim_idx):
         return "" if sim_idx == 1 else real(flight, sim_idx)
 
-    montecarlo._MonteCarlo__evaluate_flight_outputs = drop_the_second
+    monkeypatch.setattr(
+        montecarlo, "_MonteCarlo__evaluate_flight_outputs", drop_the_second
+    )
 
     with pytest.raises(RuntimeError, match="never written"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
@@ -611,7 +625,12 @@ def test_a_simulation_whose_outputs_went_missing_also_fails(
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
 def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
-    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight, parallel
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto,
+    stochastic_flight,
+    parallel,
 ):
     """A worker killed part way through a write leaves a truncated row.
 
@@ -637,14 +656,16 @@ def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
             json.loads(half)  # the row has to be unparseable for this to test it
         return half
 
-    montecarlo._MonteCarlo__evaluate_flight_inputs = cut_the_second_short
+    monkeypatch.setattr(
+        montecarlo, "_MonteCarlo__evaluate_flight_inputs", cut_the_second_short
+    )
 
     with pytest.raises(RuntimeError, match="never written"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
 
 
 def test_a_run_stopped_with_ctrl_c_keeps_what_it_saved(
-    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+    monkeypatch, tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
 ):
     """Ctrl-C is a stop, not a fault.
 
@@ -667,7 +688,9 @@ def test_a_run_stopped_with_ctrl_c_keeps_what_it_saved(
         finished.append(1)
         return real()
 
-    montecarlo._MonteCarlo__run_single_simulation = stop_after_the_first
+    monkeypatch.setattr(
+        montecarlo, "_MonteCarlo__run_single_simulation", stop_after_the_first
+    )
 
     montecarlo.simulate(number_of_simulations=3, random_seed=42)
 
