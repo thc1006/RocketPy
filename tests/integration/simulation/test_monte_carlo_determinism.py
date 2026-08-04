@@ -199,6 +199,51 @@ def test_invalid_seed_does_not_truncate_existing_output(
         assert kept.read() == "previous results\n"
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"number_of_simulations": 2.5}, TypeError),
+        ({"number_of_simulations": True}, TypeError),
+        ({"number_of_simulations": -1}, ValueError),
+        ({"number_of_simulations": 3, "parallel": True, "n_workers": 1}, ValueError),
+    ],
+    ids=["float count", "boolean count", "negative count", "one worker"],
+)
+def test_a_rejected_argument_does_not_truncate_existing_output(
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto_numpy_only,
+    stochastic_flight,
+    kwargs,
+    error,
+):
+    """Every check that needs only the arguments belongs before the logs open.
+
+    ``__setup_files`` opens both of them "w+", which empties them, and
+    ``n_workers`` was validated after that. So asking for a worker count the run
+    cannot use destroyed the previous run's results on the way to raising.
+
+    ``True`` is the one that does not raise on its own: it is an ``int`` to
+    ``isinstance``, so it would quietly have run one simulation.
+    """
+    monkeypatch.setattr(mc_module, "Flight", _StubFlight)
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / f"keep-{sorted(kwargs.items())}"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto_numpy_only,
+        flight=stochastic_flight,
+    )
+    with open(montecarlo.input_file, "w", encoding="utf-8") as existing:
+        existing.write("previous results\n")
+
+    with pytest.raises(error):
+        montecarlo.simulate(random_seed=11, **kwargs)
+
+    with open(montecarlo.input_file, encoding="utf-8") as kept:
+        assert kept.read() == "previous results\n"
+
+
 def test_serial_inputs_are_reproducible(
     monkeypatch,
     tmp_path,
@@ -574,16 +619,23 @@ def test_a_missing_simulation_is_not_reported_as_a_successful_run(
     )
     kwargs = {"parallel": True, "n_workers": 2} if parallel else {}
 
-    # Lose one simulation's inputs the way a worker dying between claiming and
-    # writing does. Driven through ``simulate`` rather than by calling the check
-    # afterwards, so this also proves the check is reached at all.
-    real = montecarlo._MonteCarlo__evaluate_flight_inputs
+    # Lose the simulation from both files, the way a worker that dies between
+    # the claim and the writes does. Driven through ``simulate`` rather than by
+    # calling the check afterwards, so this also proves the check is reached.
+    real_inputs = montecarlo._MonteCarlo__evaluate_flight_inputs
+    real_outputs = montecarlo._MonteCarlo__evaluate_flight_outputs
 
-    def drop_the_second(sim_idx):
-        return "" if sim_idx == 1 else real(sim_idx)
+    def drop_the_second_inputs(sim_idx):
+        return "" if sim_idx == 1 else real_inputs(sim_idx)
+
+    def drop_the_second_outputs(flight, sim_idx):
+        return "" if sim_idx == 1 else real_outputs(flight, sim_idx)
 
     monkeypatch.setattr(
-        montecarlo, "_MonteCarlo__evaluate_flight_inputs", drop_the_second
+        montecarlo, "_MonteCarlo__evaluate_flight_inputs", drop_the_second_inputs
+    )
+    monkeypatch.setattr(
+        montecarlo, "_MonteCarlo__evaluate_flight_outputs", drop_the_second_outputs
     )
 
     with pytest.raises(RuntimeError, match="never written"):
@@ -599,9 +651,10 @@ def test_a_simulation_whose_outputs_went_missing_also_fails(
     stochastic_flight,
     parallel,
 ):
-    """The other file. A worker that wrote its inputs and stopped before its
-    outputs leaves the two logs disagreeing, and a check that only reads the
-    inputs sees a complete run.
+    """A worker that wrote its inputs and stopped before its outputs leaves the
+    two logs disagreeing. Checking each file against the expected range on its
+    own cannot see that: the inputs file is complete, and it is only complete
+    because the row it is missing is in the other file.
     """
     montecarlo = MonteCarlo(
         filename=str(tmp_path / f"no-output-{parallel}"),
@@ -619,12 +672,12 @@ def test_a_simulation_whose_outputs_went_missing_also_fails(
         montecarlo, "_MonteCarlo__evaluate_flight_outputs", drop_the_second
     )
 
-    with pytest.raises(RuntimeError, match="never written"):
+    with pytest.raises(RuntimeError, match="disagree about which simulations"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
-def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
+def test_a_row_cut_off_mid_write_is_named_as_unreadable(
     monkeypatch,
     tmp_path,
     stochastic_environment,
@@ -634,9 +687,9 @@ def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
 ):
     """A worker killed part way through a write leaves a truncated row.
 
-    That is the case the check exists to diagnose, so it has to name the
-    simulation that went missing. Parsing the file strictly turned it into a
-    JSONDecodeError out of ``simulate`` instead, which points nowhere.
+    That row is the corruption this check exists to find, so it is named and
+    raised on. Skipping it and reporting the index as missing was a worse
+    answer: with every expected index present, a corrupt file passed.
     """
     montecarlo = MonteCarlo(
         filename=str(tmp_path / f"truncated-{parallel}"),
@@ -660,7 +713,7 @@ def test_a_row_cut_off_mid_write_is_named_as_the_missing_simulation(
         montecarlo, "_MonteCarlo__evaluate_flight_inputs", cut_the_second_short
     )
 
-    with pytest.raises(RuntimeError, match="never written"):
+    with pytest.raises(RuntimeError, match="not readable JSON"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
 
 

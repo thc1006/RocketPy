@@ -20,7 +20,7 @@ import traceback
 import warnings
 from numbers import Real
 from pathlib import Path
-from time import time
+from time import monotonic, time
 
 import numpy as np
 import simplekml
@@ -239,6 +239,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         overwritten. Make sure to save the files with the results before
         running the simulation again with `append=False`.
         """
+        # Everything that can be judged from the arguments alone happens before
+        # __setup_files, which opens both logs "w+" and empties them. Raising
+        # after that point destroys the previous run on the way out.
+        _validate_simulation_count(number_of_simulations)
+        if parallel:
+            n_workers = self.__validate_number_of_workers(n_workers)
+
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
@@ -386,43 +393,47 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         reach rather than a count to add, so the new indices are
         ``_initial_sim_idx`` up to it.
 
-        A run stopped with Ctrl-C is exempt: both run paths catch it, keep what
-        they have and return, so being short is the point rather than a fault.
+        A run stopped with Ctrl-C is short on purpose, so the indices it never
+        reached are not an error. What it did write is still held to the rest:
+        readable rows, one row per index, and nothing outside the range.
+
+        Indices below ``_initial_sim_idx`` are an earlier run's and are left
+        alone. Reconciling a history with holes in it is a separate job, and
+        this only answers for the simulations this run claimed.
         """
-        expected = set(range(self._initial_sim_idx, self.number_of_simulations))
-        if not expected or self._interrupted:
-            # A stopped run is short by definition and already said so. Checking
-            # it anyway contradicted the "Files saved." it had just printed.
-            return
+        inputs = _recorded_indices("inputs", self.input_file)
+        outputs = _recorded_indices("outputs", self.output_file)
+        if inputs != outputs:
+            only_in = lambda a, b: sorted(set(a) - set(b))  # noqa: E731
+            raise RuntimeError(
+                f"the input and output files disagree about which simulations "
+                f"ran: {only_in(inputs, outputs)[:5]} have inputs and no "
+                f"outputs, {only_in(outputs, inputs)[:5]} the other way round. "
+                f"A worker stopped between the two writes, so the results are "
+                f"not reported as a successful run."
+            )
 
-        for label, path in (
-            ("inputs", self.input_file),
-            ("outputs", self.output_file),
-        ):
-            written = {}
-            with open(path, mode="r", encoding="utf-8") as rows:
-                for line in rows:
-                    line = line.strip()
-                    if line:
-                        try:
-                            index = json.loads(line).get("index")
-                        except ValueError:
-                            # A worker killed mid-write leaves a partial row.
-                            # Skipping it reports that index as missing, which
-                            # is what happened, rather than failing to parse.
-                            continue
-                        written[index] = written.get(index, 0) + 1
-
-            missing = sorted(expected - set(written))
-            repeated = sorted(index for index in expected if written.get(index, 0) > 1)
-            if missing or repeated:
-                raise RuntimeError(
-                    f"the {label} file does not match the simulations that ran: "
-                    f"{len(missing)} never written {missing[:5]}, "
-                    f"{len(repeated)} written more than once {repeated[:5]}. "
-                    f"The results are incomplete, so they are not reported as a "
-                    f"successful run."
-                )
+        repeated = sorted(index for index, count in inputs.items() if count > 1)
+        beyond = sorted(
+            index for index in inputs if index >= self.number_of_simulations
+        )
+        missing = (
+            []
+            if self._interrupted
+            else sorted(
+                set(range(self._initial_sim_idx, self.number_of_simulations))
+                - set(inputs)
+            )
+        )
+        if missing or repeated or beyond:
+            raise RuntimeError(
+                f"the files do not match the simulations that ran: "
+                f"{len(missing)} never written {missing[:5]}, "
+                f"{len(repeated)} written more than once {repeated[:5]}, "
+                f"{len(beyond)} outside the range this run claimed {beyond[:5]}. "
+                f"The results are wrong, so they are not reported as a "
+                f"successful run."
+            )
 
     def __run_in_serial(self):
         """
@@ -441,20 +452,24 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             start_time=time(),
         )
         try:
-            while sim_monitor.keep_simulating():
+            while True:
+                # First statement in the loop, so it is bound before the two
+                # monitor calls rather than after them. Ctrl-C in either one
+                # used to leave it unbound, or holding the last completed row.
+                inputs_json = ""
+
+                if not sim_monitor.keep_simulating():
+                    break
                 sim_idx = sim_monitor.increment() - 1
-                inputs_json, outputs_json = "", ""
 
                 self.__seed_simulation(self.__child_seed(sim_idx))
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
-                with open(self.input_file, "a", encoding="utf-8") as f:
-                    f.write(inputs_json)
-                with open(self.output_file, "a", encoding="utf-8") as f:
-                    f.write(outputs_json)
-
+                _record_simulation(
+                    self.input_file, self.output_file, inputs_json, outputs_json
+                )
                 sim_monitor.print_update_status()
 
             sim_monitor.print_final_status()
@@ -530,9 +545,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     sim_producer.start()
                     started_processes.append(sim_producer)
 
-                for sim_producer in started_processes:
-                    sim_producer.join()
-
+                _wait_for_workers(started_processes, simulation_error_event)
+                _stop_any_worker_still_running(started_processes)
                 _fail_if_a_worker_did_not_finish(
                     started_processes, simulation_error_event, self.error_file
                 )
@@ -542,11 +556,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             # Handle error from the main process
             # pylint: disable=broad-except
             except (Exception, KeyboardInterrupt) as error:
-                simulation_error_event.set()
-
-                for sim_producer in started_processes:
-                    sim_producer.join()
-
+                _bring_the_fleet_down(started_processes, simulation_error_event)
                 self._interrupted = isinstance(error, KeyboardInterrupt)
                 if not self._interrupted:
                     raise error
@@ -554,8 +564,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 _stop_any_worker_still_running(started_processes)
 
     def __validate_number_of_workers(self, n_workers):
-        if n_workers is None or n_workers > os.cpu_count():
-            n_workers = os.cpu_count()
+        # os.cpu_count() is documented as possibly None, and comparing against
+        # it then raises rather than falling back to a usable default.
+        available = os.cpu_count() or 2
+        if n_workers is not None and type(n_workers) not in (int, np.integer):  # noqa: E721
+            raise TypeError(
+                f"Number of workers must be an integer, not {type(n_workers).__name__}."
+            )
+        if n_workers is None or n_workers > available:
+            n_workers = available
 
         if n_workers < 2:
             raise ValueError("Number of workers must be at least 2 for parallel mode.")
@@ -573,28 +590,27 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         error_event : multiprocess.Event
             Event signaling an error occurred during the simulation.
         """
-        # Bound before the try, not inside the loop. The handler below reports
-        # both, and a failure in the claim itself left them unassigned, so the
-        # original error was replaced by an UnboundLocalError raised out of the
-        # handler with the mutex still held.
-        sim_idx = None
-        inputs_json = ""
-        outputs_json = ""
         try:
             while True:
+                # First statement in the loop, so it is bound before the claim
+                # rather than after it. A claim that failed left these unassigned
+                # and the handler raised UnboundLocalError over the real error;
+                # a claim that failed on a later lap reported the previous row.
+                sim_idx, inputs_json, outputs_json = None, "", ""
+
                 sim_idx = _claim_next_index(sim_monitor, mutex)
                 if sim_idx is None:
                     break
-
-                inputs_json, outputs_json = "", ""
 
                 self.__seed_simulation(self.__child_seed(sim_idx))
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
+                acquired = False
                 try:
                     mutex.acquire()
+                    acquired = True
                     if error_event.is_set():
                         # Runs in a worker process spawned via multiprocessing:
                         # logging handlers configured in the main process are
@@ -609,14 +625,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
                         break
 
-                    with open(self.input_file, "a", encoding="utf-8") as f:
-                        f.write(inputs_json)
-                    with open(self.output_file, "a", encoding="utf-8") as f:
-                        f.write(outputs_json)
-
+                    _record_simulation(
+                        self.input_file, self.output_file, inputs_json, outputs_json
+                    )
                     sim_monitor.print_update_status()
                 finally:
-                    mutex.release()
+                    if acquired:
+                        mutex.release()
 
         except Exception:
             # Set first, so a parent waiting on the join learns why. Best effort
@@ -628,15 +643,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 pass
             details = traceback.format_exc()
 
-            # The inputs of the failed simulation when there are any, and a
-            # record of the failure itself when it happened before they were
-            # drawn. Without the second, a failure in the claim left the error
-            # file empty while the run pointed the user at it. It is a JSON
-            # line either way, because ``_read_log_file`` parses this file with
-            # ``json.loads`` and free text in it would make the log unreadable.
-            record = inputs_json or (
-                json.dumps({"index": sim_idx, "error": details}) + "\n"
-            )
+            # The failure goes onto the inputs record rather than replacing it.
+            # Writing one or the other dropped the traceback for every failure
+            # after sampling, from the file the run tells the user to read.
+            try:
+                record = json.loads(inputs_json) if inputs_json else {"index": sim_idx}
+            except ValueError:
+                record = {"index": sim_idx}
+            record["error"] = details
+            record = json.dumps(record) + "\n"
 
             acquired = False
             try:
@@ -1830,16 +1845,138 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._write_log_to_json(self.errors_log, filename)
 
 
-def _stop_any_worker_still_running(started_processes):
+def _recorded_indices(label, path):
+    """``{index: how many rows carry it}`` for one log file.
+
+    Strict about what a row is. A row that will not parse, is not an
+    object, or carries anything but a non-negative plain ``int`` index is
+    the corruption this check exists to find, so it is named and raised on
+    rather than skipped. ``type(...) is int`` and not ``isinstance``:
+    ``True`` and ``1.0`` both compare equal to ``1`` and would otherwise
+    pass for it.
+    """
+    written = {}
+    with open(path, mode="r", encoding="utf-8") as rows:
+        for number, line in enumerate(rows, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"{label} row {number} is not readable JSON, so a "
+                    f"worker was cut off part way through writing it: "
+                    f"{line[:60]!r}"
+                ) from error
+            index = record.get("index") if isinstance(record, dict) else None
+            # isinstance is the wrong tool here, see the docstring: bool is a
+            # subclass of int, so True would pass for the index 1.
+            # pylint: disable-next=unidiomatic-typecheck
+            if type(index) is not int or index < 0:  # noqa: E721
+                raise RuntimeError(
+                    f"{label} row {number} does not carry a simulation "
+                    f"index: {line[:60]!r}"
+                )
+            written[index] = written.get(index, 0) + 1
+    return written
+
+
+def _validate_simulation_count(number_of_simulations):
+    """A count has to be a whole non-negative number, checked before any file.
+
+    ``type(...) is not int``: ``True`` is an ``int`` to ``isinstance`` and would
+    quietly run one simulation. A float ran ``int(count)`` of them and then
+    failed the completeness check with a range it could never have satisfied.
+    """
+    if type(number_of_simulations) not in (int, np.integer):  # noqa: E721
+        raise TypeError(
+            f"number_of_simulations must be an integer, not "
+            f"{type(number_of_simulations).__name__}."
+        )
+    if number_of_simulations < 0:
+        raise ValueError(
+            f"number_of_simulations must not be negative, got {number_of_simulations}."
+        )
+
+
+_WORKER_SHUTDOWN_GRACE = 5.0
+
+
+def _record_simulation(input_file, output_file, inputs_json, outputs_json):
+    """Append one simulation's inputs and outputs to their logs.
+
+    Module level rather than a method: the run paths are driven directly by
+    stub objects in the tests, and a private method is not reachable on those.
+    """
+    with open(input_file, "a", encoding="utf-8") as f:
+        f.write(inputs_json)
+    with open(output_file, "a", encoding="utf-8") as f:
+        f.write(outputs_json)
+
+
+def _bring_the_fleet_down(started_processes, error_event):
+    """Stop everything, without raising over the failure being handled.
+
+    Setting the event is best effort like the workers' own reporting: the
+    manager may be the thing that died. Then a bounded window to notice it and
+    leave, and whatever is left gets stopped.
+    """
+    try:
+        error_event.set()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
+    _stop_any_worker_still_running(started_processes)
+
+
+def _wait_for_workers(started_processes, error_event=None, timeout=None):
+    """Wait for the fleet, giving up early once one of them reports an error.
+
+    Joining each worker in turn waits on them in the order they were started. A
+    worker stuck in a native call held the parent on the first join while
+    another had already set the event, so neither the error nor the cleanup
+    after it was ever reached.
+
+    No overall deadline on the normal path: a run with no error and one worker
+    still going is a long simulation, and that is not for this to cut short.
+    """
+    deadline = None if timeout is None else monotonic() + timeout
+    while any(process.is_alive() for process in started_processes):
+        if error_event is not None and error_event.is_set():
+            break
+        if deadline is not None and monotonic() >= deadline:
+            break
+        for process in started_processes:
+            process.join(timeout=0.1)
+
+    # Reap whatever has already finished. A worker that was gone before the
+    # loop started was never joined by it, and an unjoined child has no exit
+    # code yet, so the crash check downstream would read None and call it one.
+    for process in started_processes:
+        process.join(timeout=0)
+
+
+def _stop_any_worker_still_running(started_processes, grace=_WORKER_SHUTDOWN_GRACE):
     """Whatever is still going here is not going to stop on its own.
 
-    The error event was set and it did not leave. Left behind, it keeps the
-    manager, the mutex and the output files alive.
+    Signal every worker before waiting on any of them. Terminating one and
+    joining it before reaching the next let a worker that ignores the signal
+    keep the rest of the fleet, the manager and the open files alive behind it.
     """
-    for sim_producer in started_processes:
-        if sim_producer.is_alive():
-            sim_producer.terminate()
-            sim_producer.join()
+    alive = [process for process in started_processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+    for process in alive:
+        process.join(timeout=grace)
+
+    # terminate is a request. SIGKILL is not, and a worker that sat through the
+    # first one would otherwise keep the manager and the files open for good.
+    stubborn = [process for process in alive if process.is_alive()]
+    for process in stubborn:
+        process.kill()
+    for process in stubborn:
+        process.join(timeout=grace)
 
 
 def _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file):
