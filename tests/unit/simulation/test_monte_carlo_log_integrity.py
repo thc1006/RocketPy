@@ -12,7 +12,6 @@ to survive that.
 
 import threading
 import types
-import warnings
 
 import pytest
 
@@ -68,32 +67,28 @@ def test_a_corrupt_log_is_not_a_successful_run(tmp_path, rows, expected):
         _check(_runner(tmp_path, rows))
 
 
-def test_an_append_run_is_not_judged_on_the_damage_it_inherited(tmp_path):
-    """The documented way to reach an append is to interrupt a run, so the file
-    it appends to can hold a torn row or a pair that disagrees. Judging this run
-    on that made the very files append exists for the ones it refused.
+def test_a_checkpoint_that_cannot_be_read_is_refused_before_the_run(tmp_path):
+    """Where the history is judged: before anything runs, not after.
 
-    Measured before the fix: all three of these were refused, so a file could be
-    damaged once and never resumed again.
+    An earlier round tolerated inherited damage at the end of the run, on the
+    grounds that the documented way to reach an append is to interrupt a run.
+    That was the wrong place for it. A torn row holds an index nobody can
+    recover, so the resume point cannot be trusted either, and resuming at the
+    wrong one silently skips a simulation. The preflight refuses instead, with
+    both files left exactly as they were found.
     """
-    new_rows = '{"index": 2}\n{"index": 3}\n'
-    inherited = {
-        "a duplicate": ('{"index": 0}\n{"index": 0}\n', None),
-        "a torn row": ('{"index": 0}\n{not json\n', None),
-        "files that disagree": ('{"index": 0}\n{"index": 1}\n', '{"index": 0}\n'),
-    }
-    for name, (history, other) in inherited.items():
-        runner = _runner(
-            tmp_path,
-            history + new_rows,
-            outputs=(other or history) + new_rows,
-            count=4,
-            initial=2,
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            _check(runner)  # must not raise, whatever the history looks like
-        assert True, name
+    rows = '{"index": 0}\n{not json\n'
+    inputs, outputs = tmp_path / "i.txt", tmp_path / "o.txt"
+    inputs.write_text(rows)
+    outputs.write_text(rows)
+    before = inputs.read_bytes(), outputs.read_bytes()
+
+    with pytest.raises(ValueError, match="cannot be read"):
+        mc._check_the_checkpoint_supports_appending(inputs, outputs, 2)
+
+    assert (inputs.read_bytes(), outputs.read_bytes()) == before, (
+        "a refused checkpoint was modified on the way out"
+    )
 
 
 def test_this_run_is_still_judged_strictly_while_appending(tmp_path):
@@ -441,3 +436,31 @@ def test_ctrl_c_between_rows_does_not_report_the_row_that_succeeded(
     assert (tmp_path / "errors.txt").read_text() == "", (
         "a completed simulation was written to the error file as if it failed"
     )
+
+
+def test_a_history_that_went_missing_is_still_caught_at_the_end(tmp_path):
+    """The run is judged on every index asked for, not on its own share.
+
+    Appending normally reaches this past a preflight that found the checkpoint
+    whole, so the two questions have the same answer there. They do not when
+    the check is asked directly, and the invariant worth stating is the one
+    about the whole file: a four-simulation result holds four simulations.
+    """
+    runner = _runner(tmp_path, '{"index": 2}\n{"index": 3}\n', count=4, initial=2)
+
+    with pytest.raises(RuntimeError, match="never written"):
+        _check(runner)
+
+
+def test_a_checkpoint_numbered_from_one_is_named_as_such(tmp_path):
+    """Serial runs used to number from 1. Appending onto one would rewrite the
+    last index rather than continue, so it is refused by name: the fix is to
+    re-baseline, not to retry, and an off-by-one message would not say that.
+    """
+    rows = "".join('{"index": %d}\n' % index for index in (1, 2, 3))
+    inputs, outputs = tmp_path / "i.txt", tmp_path / "o.txt"
+    inputs.write_text(rows)
+    outputs.write_text(rows)
+
+    with pytest.raises(ValueError, match="numbered from 1"):
+        mc._check_the_checkpoint_supports_appending(inputs, outputs, 3)

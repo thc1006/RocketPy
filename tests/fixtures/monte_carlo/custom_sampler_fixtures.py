@@ -33,7 +33,7 @@ class TwoGaussianMixture(CustomSampler):
             2-Tuple that contains the probability of each normal distribution of the
             mixture. Its entries should be non-negative and sum up to 1.
         """
-        np.random.default_rng(seed)
+        self.reset_seed(seed)
         self.means_tuple = means_tuple
         self.sd_tuple = sd_tuple
         self.prob_tuple = prob_tuple
@@ -52,16 +52,12 @@ class TwoGaussianMixture(CustomSampler):
             List containing n_samples samples
         """
         samples_list = [0] * n_samples
-        mixture_id_list = np.random.binomial(1, self.prob_tuple[0], n_samples)
+        mixture_id_list = self.rng.binomial(1, self.prob_tuple[0], n_samples)
         for i, mixture_id in enumerate(mixture_id_list):
             if mixture_id:
-                samples_list[i] = np.random.normal(
-                    self.means_tuple[0], self.sd_tuple[0]
-                )
+                samples_list[i] = self.rng.normal(self.means_tuple[0], self.sd_tuple[0])
             else:
-                samples_list[i] = np.random.normal(
-                    self.means_tuple[1], self.sd_tuple[1]
-                )
+                samples_list[i] = self.rng.normal(self.means_tuple[1], self.sd_tuple[1])
 
         return samples_list
 
@@ -73,4 +69,7 @@ class TwoGaussianMixture(CustomSampler):
         seed : int, optional
             Seed for the random number generator.
         """
-        np.random.default_rng(seed)
+        # Kept on the instance. Building a generator and dropping it made this
+        # a no-op, and sample() went on drawing from the process-global
+        # np.random, so nothing here answered to the seed at all.
+        self.rng = np.random.default_rng(seed)

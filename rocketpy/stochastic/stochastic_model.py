@@ -139,6 +139,13 @@ class StochasticModel:
         of ``self.obj``'s, and nothing writes back to those, so it is passed
         straight through. Caching it here would be wrong as well: every
         component's position arrives under the one name ``"position"``.
+
+        This applies to every stochastic model, not only the environment: what
+        a model samples around is what the wrapped object held when the model
+        was built. Changing the object afterwards does not move it. Only
+        ``StochasticEnvironment.create_object`` writes back today, but the rule
+        is stated for all of them rather than special-cased for one, so a model
+        means the same thing whichever object it wraps.
         """
         if getter is not getattr:
             return getter(self.obj, input_name)

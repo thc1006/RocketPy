@@ -796,13 +796,16 @@ def test_a_run_stopped_with_ctrl_c_keeps_what_it_saved(
     assert _count_rows(montecarlo.input_file) == 1
 
 
-def test_appending_checks_only_the_simulations_the_run_added(
+def test_appending_continues_a_checkpoint_and_leaves_the_whole_range(
     tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
 ):
-    """``append=True`` leaves the earlier run's records in the same files, and
-    ``number_of_simulations`` is the total to reach rather than a count to add.
-    The check has to look at indices ``_initial_sim_idx`` upwards, or a second
-    run would be judged against records it never wrote.
+    """A second run carries on from the first, and the pair ends up whole.
+
+    This test used to empty both logs before appending and then assert that a
+    four-simulation result holding only indices 2 and 3 was a success. That is
+    the shape of the bug it was meant to guard: the resume point came from a
+    row count rather than the indices actually on disk, so nothing noticed the
+    first two were gone. The run is judged on the whole range now.
     """
     montecarlo = MonteCarlo(
         filename=str(tmp_path / "appended"),
@@ -811,21 +814,91 @@ def test_appending_checks_only_the_simulations_the_run_added(
         flight=stochastic_flight,
     )
     montecarlo.simulate(number_of_simulations=2, random_seed=606)
-
     assert _count_rows(montecarlo.input_file) == 2
-
-    # Take the first run's records away before appending. The second run is
-    # judged on what it wrote, so a check counting the whole file would call
-    # this incomplete even though nothing went wrong.
-    montecarlo.input_file.write_text("", encoding="utf-8")
-    montecarlo.output_file.write_text("", encoding="utf-8")
 
     montecarlo.simulate(number_of_simulations=4, append=True, random_seed=606)
 
     assert montecarlo._initial_sim_idx == 2, (
         "the second run should have started where the first stopped"
     )
-    written = _read_inputs_by_index(montecarlo.input_file)
-    assert sorted(written) == [2, 3], (
-        f"the appended run wrote the wrong indices: {sorted(written)}"
+    for label, path in (
+        ("inputs", montecarlo.input_file),
+        ("outputs", montecarlo.output_file),
+    ):
+        assert sorted(_read_inputs_by_index(path)) == [0, 1, 2, 3], (
+            f"the {label} do not hold every simulation that was asked for"
+        )
+
+
+def test_appending_onto_a_checkpoint_with_a_hole_is_refused(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+):
+    """The other half, and the reason the resume point cannot be a row count.
+
+    Two rows plus a blank line load as three simulations, so the next run would
+    start at index 2 and leave index 1 missing for good while reporting
+    success. Refused before it runs, with both files left as they were found.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "holed"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
     )
+    montecarlo.simulate(number_of_simulations=2, random_seed=606)
+
+    with open(montecarlo.output_file, "a", encoding="utf-8") as log:
+        log.write("\n")
+    montecarlo.set_num_of_loaded_sims()
+    assert montecarlo.num_of_loaded_sims == 3, "the blank line was not counted"
+    before = (
+        montecarlo.input_file.read_bytes(),
+        montecarlo.output_file.read_bytes(),
+    )
+
+    with pytest.raises(ValueError):
+        montecarlo.simulate(number_of_simulations=5, append=True, random_seed=606)
+
+    assert (
+        montecarlo.input_file.read_bytes(),
+        montecarlo.output_file.read_bytes(),
+    ) == before, "a refused checkpoint was modified on the way out"
+
+
+def test_a_missing_parallel_dependency_does_not_cost_the_previous_run(
+    monkeypatch,
+    tmp_path,
+    stochastic_environment,
+    stochastic_calisto_numpy_only,
+    stochastic_flight,
+):
+    """``multiprocess`` is an optional extra, so an install without
+    ``rocketpy[monte-carlo]`` cannot run in parallel at all.
+
+    It used to be imported inside the parallel path, which runs after
+    ``__setup_files`` has opened both logs "w+" and emptied them, so asking for
+    a parallel run on such an install destroyed the previous results on the way
+    to the ImportError.
+    """
+    monkeypatch.setattr(mc_module, "Flight", _StubFlight)
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "kept"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto_numpy_only,
+        flight=stochastic_flight,
+    )
+    with open(montecarlo.input_file, "w", encoding="utf-8") as existing:
+        existing.write("previous results\n")
+
+    def no_multiprocess():
+        raise ImportError("No module named 'multiprocess'")
+
+    monkeypatch.setattr(mc_module, "_import_multiprocess", no_multiprocess)
+
+    with pytest.raises(ImportError):
+        montecarlo.simulate(
+            number_of_simulations=2, parallel=True, n_workers=2, random_seed=7
+        )
+
+    with open(montecarlo.input_file, encoding="utf-8") as kept:
+        assert kept.read() == "previous results\n"

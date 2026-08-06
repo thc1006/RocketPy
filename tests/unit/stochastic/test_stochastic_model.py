@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import numpy as np
+
 import pytest
 
 from rocketpy.stochastic import StochasticFreeFormFins
@@ -153,3 +155,65 @@ def test_a_scalar_nominal_does_not_drift_across_reseeds():
         elevations.append(float(stochastic.create_object().elevation))
 
     assert len(set(elevations)) == 1, f"the nominal elevation drifted: {elevations}"
+
+
+def test_a_custom_sampler_answers_to_the_seed_it_is_given(elevation_sampler):
+    """The 128-bit int this package hands a sampler has to reach its draws.
+
+    The fixture used to build a generator in ``reset_seed`` and drop it, while
+    ``sample`` drew from the process-global ``np.random``, so nothing in it
+    answered to a seed and the guarantee went untested.
+    """
+    wide = 271828182845904523536028747135266249775
+
+    elevation_sampler.reset_seed(wide)
+    first = elevation_sampler.sample(5)
+    elevation_sampler.reset_seed(wide)
+    again = elevation_sampler.sample(5)
+
+    assert first == again, "the same seed gave a different sample"
+
+    elevation_sampler.reset_seed(wide + 1)
+    other = elevation_sampler.sample(5)
+
+    assert other != first, "a different seed gave the same sample"
+
+
+def test_a_custom_sampler_is_not_moved_by_the_global_generator(elevation_sampler):
+    """The control for the test above. Drawing from the global stream in
+    between must not change what the seeded sampler produces, or the sampler is
+    still reading from somewhere this package does not seed."""
+    seed = 12345678901234567890123456789012345678
+
+    elevation_sampler.reset_seed(seed)
+    expected = elevation_sampler.sample(5)
+
+    elevation_sampler.reset_seed(seed)
+    np.random.random(100)
+    assert elevation_sampler.sample(5) == expected
+
+
+def test_the_nominal_is_the_one_the_model_was_built_with(example_plain_env):
+    """Snapshot semantics, stated once and pinned here.
+
+    A model samples around what the wrapped object held when it was built.
+    This exists because ``StochasticEnvironment.create_object`` writes the
+    sampled value back onto that object on purpose, and reading the nominal
+    back off it made a factor compound from one simulation to the next. The
+    rule is the same for every model, so a change to the wrapped object after
+    construction deliberately does not move what is sampled around.
+    """
+    example_plain_env.elevation = 1000
+    # A scalar is a spread around the object's own value, so this is the form
+    # that reads the nominal. A tuple carries its own centre and would not.
+    model = StochasticEnvironment(environment=example_plain_env, elevation=5)
+
+    model._set_stochastic(4242)
+    around_first = model.elevation[0]
+
+    example_plain_env.elevation = 9000
+    model._set_stochastic(4242)
+
+    assert model.elevation[0] == around_first == 1000, (
+        "the model followed the object instead of the value it was built with"
+    )

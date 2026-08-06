@@ -204,7 +204,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             with a 128-bit integer -- the seed type a custom sampler's
             ``reset_seed`` accepts. A stateful ``numpy.random.Generator`` or
             ``BitGenerator`` is rejected (it is an RNG to draw from, not a fixed
-            seed); pass ``rng.bit_generator.seed_seq`` to seed from one. Default is
+            seed); pass the seed it was built from. Default is
             None, which draws fresh entropy on each run -- the previous,
             non-reproducible default. This seeding is informed by Scientific Python
             SPEC 7 but keeps immutable seed-snapshot semantics rather than sharing a
@@ -245,10 +245,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         _validate_simulation_count(number_of_simulations)
         if parallel:
             n_workers = self.__validate_number_of_workers(n_workers)
+            # multiprocess is an optional extra. Imported here, an install
+            # without rocketpy[monte-carlo] raised only after __setup_files had
+            # already emptied the previous run's results.
+            _import_multiprocess()
 
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
+        if append:
+            _check_the_checkpoint_supports_appending(
+                self.input_file, self.output_file, self._initial_sim_idx
+            )
         # Both run paths catch Ctrl-C, save what they have and return, so a
         # stopped run is incomplete on purpose and the completeness check below
         # has to know the difference between that and a worker going missing.
@@ -317,16 +325,19 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         child counter between calls; repeated ``simulate`` calls with the same
         seed then stay reproducible. A stateful ``Generator``/``BitGenerator`` is
         not accepted, since using it as an immutable seed would contradict its
-        consume-on-use semantics; pass ``rng.bit_generator.seed_seq`` to seed
-        from an existing generator's stream.
+        consume-on-use semantics. Pass the seed the generator was built from.
+        ``rng.bit_generator.seed_seq`` also works, but only on NumPy 1.25 and
+        above, which is later than this package's floor.
         """
         if isinstance(random_seed, np.random.SeedSequence):
             return np.random.SeedSequence(**random_seed.state)
         if isinstance(random_seed, (np.random.Generator, np.random.BitGenerator)):
             raise TypeError(
-                "random_seed must be an int or a numpy.random.SeedSequence, not "
-                f"a {type(random_seed).__name__}; to seed from an existing "
-                "generator pass rng.bit_generator.seed_seq."
+                "random_seed must be an int, a sequence of non-negative "
+                "integers, or a numpy.random.SeedSequence, not a "
+                f"{type(random_seed).__name__}. Pass the seed the generator "
+                "was built from; rng.bit_generator.seed_seq also works on "
+                "NumPy 1.25 and above."
             )
         return np.random.SeedSequence(random_seed)
 
@@ -408,18 +419,14 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         outputs, damaged_outputs = _recorded_indices("outputs", self.output_file)
         damaged += damaged_outputs
 
-        # First, because a torn row is the root cause and the checks below are its
-        # symptoms: a row that will not parse also makes the two files
+        # First, because a torn row is the root cause and the checks below are
+        # its symptoms: a row that will not parse also makes the two files
         # disagree, and "files disagree" points at the wrong thing.
-        # A file this run did not write is the earlier run's business.
-        if damaged and self._initial_sim_idx:
-            warnings.warn(
-                f"{len(damaged)} row(s) an earlier run left behind are not "
-                f"readable and were skipped: {damaged[:3]}. The simulations "
-                f"this run added are unaffected.",
-                UserWarning,
-            )
-        elif damaged:
+        #
+        # Always this run's doing. An append only gets here past a preflight
+        # that read the checkpoint and found it whole, so anything unreadable
+        # now was written during this run.
+        if damaged:
             raise RuntimeError(
                 f"{len(damaged)} row(s) this run wrote cannot be read: "
                 f"{damaged[:5]}. The results are wrong, so they are not "
@@ -447,10 +454,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         missing = (
             []
             if self._interrupted
-            else sorted(
-                set(range(self._initial_sim_idx, self.number_of_simulations))
-                - set(mine)
-            )
+            # The whole range, not this run's share of it. Appending is only
+            # allowed onto a checkpoint the preflight found complete, so what
+            # ends up on disk has to be every simulation that was asked for.
+            else sorted(set(range(self.number_of_simulations)) - set(inputs))
         )
         if missing or repeated or beyond:
             raise RuntimeError(
@@ -1909,6 +1916,73 @@ def _recorded_indices(label, path):
                 continue
             written[index] = written.get(index, 0) + 1
     return written, damaged
+
+
+def _check_the_checkpoint_supports_appending(input_file, output_file, resume_at):
+    """Everything that can be judged from the files, before a worker starts.
+
+    ``num_of_loaded_sims`` counts lines rather than indices, so a blank line or
+    a torn row moves the resume point past an index that was never run. The run
+    then skips it, and a check scoped to the new range calls that a success.
+    Measured: two rows plus one blank line resume at 3, plus two blanks at 4,
+    while the file holds only 0 and 1 either way.
+
+    Held here rather than after the run so a checkpoint that cannot be resumed
+    costs no simulations and is left exactly as it was found.
+
+    A file with a hole in it is refused rather than repaired. Filling holes
+    needs the workers to claim from a plan instead of counting on from the end,
+    which is #1075; until then, refusing loudly beats resuming in the wrong
+    place quietly.
+    """
+    for label, path in (("inputs", input_file), ("outputs", output_file)):
+        written, damaged = _recorded_indices(label, path)
+        if damaged:
+            raise ValueError(
+                f"cannot append to {path}: {len(damaged)} row(s) cannot be "
+                f"read, so the simulations they held cannot be accounted for: "
+                f"{damaged[:3]}."
+            )
+        _refuse_a_checkpoint_that_does_not_line_up(label, path, written, resume_at)
+
+    inputs, _ = _recorded_indices("inputs", input_file)
+    outputs, _ = _recorded_indices("outputs", output_file)
+    if inputs != outputs:
+        raise ValueError(
+            f"cannot append: the input and output files hold different "
+            f"simulations, {sorted(set(inputs) - set(outputs))[:5]} against "
+            f"{sorted(set(outputs) - set(inputs))[:5]}. Appending would build "
+            f"on a checkpoint that is already inconsistent."
+        )
+
+
+def _refuse_a_checkpoint_that_does_not_line_up(label, path, written, resume_at):
+    """One file's indices have to be 0..resume_at-1, with nothing repeated."""
+    repeated = sorted(index for index, count in written.items() if count > 1)
+    if repeated:
+        raise ValueError(
+            f"cannot append to {path}: {label} hold {len(repeated)} index(es) "
+            f"more than once {repeated[:5]}."
+        )
+
+    indices = set(written)
+    if indices == set(range(1, len(indices) + 1)) and indices:
+        # The serial path used to number from 1. Named rather than reported as
+        # an off-by-one, because the fix is to re-baseline, not to retry.
+        raise ValueError(
+            f"cannot append to {path}: the {label} are numbered from 1, which "
+            f"is how versions before per-index seeding wrote serial runs. This "
+            f"release numbers from 0, so the two cannot be continued into each "
+            f"other. Re-run the study, or renumber the file down by one."
+        )
+    if indices != set(range(resume_at)):
+        missing = sorted(set(range(resume_at)) - indices)
+        extra = sorted(indices - set(range(resume_at)))
+        raise ValueError(
+            f"cannot append to {path}: the run would start at index "
+            f"{resume_at}, but the {label} are not the {resume_at} before it. "
+            f"Missing {missing[:5]}, unexpected {extra[:5]}."
+        )
 
 
 def _validate_simulation_count(number_of_simulations):
