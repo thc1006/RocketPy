@@ -9,6 +9,7 @@ is what separates those from a clean finish.
 
 import types
 from contextlib import contextmanager
+from time import monotonic
 
 import pytest
 
@@ -148,6 +149,66 @@ def test_a_failed_start_still_cleans_up_the_workers_already_running(
 
     assert started, "the fixture never started anything"
     assert all(p.terminated for p in started), "a started worker was left running"
+
+
+def test_a_worker_still_writing_gets_a_window_before_it_is_signalled(
+    parallel_runner, monkeypatch
+):
+    """The event asks the fleet to stop, it does not stop it.
+
+    Cutting a worker off the moment another one reports an error truncates
+    whatever row it was part way through, which is the corruption the
+    completeness check then reports. Measured before the fix: the main error
+    path gave a running worker 0.0 ms, while the interrupt path gave it the
+    full grace period.
+    """
+    grace = 0.3
+    monkeypatch.setattr(mc, "_WORKER_SHUTDOWN_GRACE", grace)
+    signalled = []
+    original_terminate = _Process.terminate
+
+    def note_when(self):
+        signalled.append(monotonic())
+        self._alive = False
+        original_terminate(self)
+
+    monkeypatch.setattr(_Process, "start", lambda self: setattr(self, "_alive", True))
+    monkeypatch.setattr(
+        _Process, "is_alive", lambda self: getattr(self, "_alive", False)
+    )
+    monkeypatch.setattr(_Process, "terminate", note_when)
+
+    # Another worker has already reported an error while this one is going.
+    class _AlreadyFailed(_Event):
+        def __init__(self):
+            super().__init__()
+            self.flag = True
+
+    class _FailedManager:  # pylint: disable=invalid-name
+        def Lock(self):  # noqa: N802
+            return types.SimpleNamespace(acquire=lambda: None, release=lambda: None)
+
+        def Event(self):  # noqa: N802
+            return _AlreadyFailed()
+
+        def _SimMonitor(self, **kwargs):  # noqa: N802
+            return _Monitor(**kwargs)
+
+    @contextmanager
+    def failed_manager(*_a, **_k):
+        yield _FailedManager()
+
+    monkeypatch.setattr(mc, "_create_multiprocess_manager", failed_manager)
+
+    began = monotonic()
+    with pytest.raises(RuntimeError):
+        mc.MonteCarlo._MonteCarlo__run_in_parallel(parallel_runner, n_workers=2)
+
+    assert signalled, "the worker was never signalled at all"
+    assert signalled[0] - began >= grace, (
+        f"the worker was cut off after {(signalled[0] - began) * 1000:.1f} ms, "
+        f"before the {grace * 1000:.0f} ms window it is meant to get"
+    )
 
 
 def test_an_interrupted_run_is_not_then_reported_as_incomplete(

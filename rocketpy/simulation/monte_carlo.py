@@ -397,32 +397,59 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         reached are not an error. What it did write is still held to the rest:
         readable rows, one row per index, and nothing outside the range.
 
-        Indices below ``_initial_sim_idx`` are an earlier run's and are left
-        alone. Reconciling a history with holes in it is a separate job, and
-        this only answers for the simulations this run claimed.
+        Only over the indices this run claimed. An ``append`` run exists to
+        carry on from a file some earlier run left behind, and the documented
+        way to reach one is to interrupt a run, so that file can hold a torn
+        row or a pair that disagrees. Judging this run on that damage would
+        make the very files ``append`` is for the ones it refuses, so anything
+        below ``_initial_sim_idx`` is reported and not raised on.
         """
-        inputs = _recorded_indices("inputs", self.input_file)
-        outputs = _recorded_indices("outputs", self.output_file)
-        if inputs != outputs:
+        inputs, damaged = _recorded_indices("inputs", self.input_file)
+        outputs, damaged_outputs = _recorded_indices("outputs", self.output_file)
+        damaged += damaged_outputs
+
+        # First, because a torn row is the root cause and the checks below are its
+        # symptoms: a row that will not parse also makes the two files
+        # disagree, and "files disagree" points at the wrong thing.
+        # A file this run did not write is the earlier run's business.
+        if damaged and self._initial_sim_idx:
+            warnings.warn(
+                f"{len(damaged)} row(s) an earlier run left behind are not "
+                f"readable and were skipped: {damaged[:3]}. The simulations "
+                f"this run added are unaffected.",
+                UserWarning,
+            )
+        elif damaged:
+            raise RuntimeError(
+                f"{len(damaged)} row(s) this run wrote cannot be read: "
+                f"{damaged[:5]}. The results are wrong, so they are not "
+                f"reported as a successful run."
+            )
+
+        ours = lambda counts: {  # noqa: E731
+            index: count
+            for index, count in counts.items()
+            if index >= self._initial_sim_idx
+        }
+        mine, theirs = ours(inputs), ours(outputs)
+        if mine != theirs:
             only_in = lambda a, b: sorted(set(a) - set(b))  # noqa: E731
             raise RuntimeError(
                 f"the input and output files disagree about which simulations "
-                f"ran: {only_in(inputs, outputs)[:5]} have inputs and no "
-                f"outputs, {only_in(outputs, inputs)[:5]} the other way round. "
+                f"ran: {only_in(mine, theirs)[:5]} have inputs and no "
+                f"outputs, {only_in(theirs, mine)[:5]} the other way round. "
                 f"A worker stopped between the two writes, so the results are "
                 f"not reported as a successful run."
             )
 
-        repeated = sorted(index for index, count in inputs.items() if count > 1)
-        beyond = sorted(
-            index for index in inputs if index >= self.number_of_simulations
-        )
+        repeated = sorted(index for index, count in mine.items() if count > 1)
+        beyond = sorted(index for index in mine if index >= self.number_of_simulations)
         missing = (
             []
             if self._interrupted
             else sorted(
                 set(range(self._initial_sim_idx, self.number_of_simulations))
-                - set(inputs)
+                - set(mine)
             )
         )
         if missing or repeated or beyond:
@@ -546,6 +573,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     started_processes.append(sim_producer)
 
                 _wait_for_workers(started_processes, simulation_error_event)
+                # The event asks them to stop, it does not stop them. Without
+                # this window a worker part way through a write is cut off and
+                # leaves exactly the torn row the check below would report.
+                # Not _bring_the_fleet_down: that sets the event, which on a run
+                # that finished cleanly is what the crash check reads next.
+                _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
                 _stop_any_worker_still_running(started_processes)
                 _fail_if_a_worker_did_not_finish(
                     started_processes, simulation_error_event, self.error_file
@@ -1846,16 +1879,17 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
 
 def _recorded_indices(label, path):
-    """``{index: how many rows carry it}`` for one log file.
+    """``({index: how many rows carry it}, [rows that carry no usable index])``.
 
-    Strict about what a row is. A row that will not parse, is not an
-    object, or carries anything but a non-negative plain ``int`` index is
-    the corruption this check exists to find, so it is named and raised on
-    rather than skipped. ``type(...) is int`` and not ``isinstance``:
-    ``True`` and ``1.0`` both compare equal to ``1`` and would otherwise
-    pass for it.
+    Damage is returned rather than raised on. Whether a torn row matters
+    depends on which run wrote it, and only the caller knows the range this
+    run claimed: an ``append`` run is recovering from a file some earlier run
+    damaged, which is the whole reason it is appending.
+
+    ``type(...) is int`` and not ``isinstance``: ``True`` and ``1.0`` both
+    compare equal to ``1`` and would otherwise pass for it.
     """
-    written = {}
+    written, damaged = {}, []
     with open(path, mode="r", encoding="utf-8") as rows:
         for number, line in enumerate(rows, start=1):
             line = line.strip()
@@ -1863,23 +1897,18 @@ def _recorded_indices(label, path):
                 continue
             try:
                 record = json.loads(line)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"{label} row {number} is not readable JSON, so a "
-                    f"worker was cut off part way through writing it: "
-                    f"{line[:60]!r}"
-                ) from error
+            except ValueError:
+                damaged.append(f"{label} row {number} is not readable JSON")
+                continue
             index = record.get("index") if isinstance(record, dict) else None
             # isinstance is the wrong tool here, see the docstring: bool is a
             # subclass of int, so True would pass for the index 1.
             # pylint: disable-next=unidiomatic-typecheck
             if type(index) is not int or index < 0:  # noqa: E721
-                raise RuntimeError(
-                    f"{label} row {number} does not carry a simulation "
-                    f"index: {line[:60]!r}"
-                )
+                damaged.append(f"{label} row {number} carries no simulation index")
+                continue
             written[index] = written.get(index, 0) + 1
-    return written
+    return written, damaged
 
 
 def _validate_simulation_count(number_of_simulations):

@@ -503,6 +503,46 @@ def restore_start_method():
     multiprocess.set_start_method(original, force=True)
 
 
+def test_the_real_parallel_path_is_worker_invariant_on_this_platform(
+    tmp_path,
+    stochastic_environment_with_wind,
+    stochastic_calisto_numpy_only,
+    stochastic_flight,
+):
+    """The same property as the test below, on whatever start method this
+    platform uses, and without the ``slow`` marker.
+
+    The thorough version covers fork, spawn and forkserver, but it is marked
+    slow and pull-request CI skips slow tests, so the path this change exists
+    to support gated nothing. This one is small enough to run every time, and
+    because it takes the platform default, each CI job ends up gating the start
+    method it actually uses: spawn on Windows and macOS, forkserver on Python
+    3.14's POSIX default, fork below that.
+    """
+    count = 2
+    common = {"number_of_simulations": count, "random_seed": 24680}
+    models = (
+        stochastic_environment_with_wind,
+        stochastic_calisto_numpy_only,
+        stochastic_flight,
+    )
+    serial = _real_run_inputs(tmp_path, *models, "here-serial", **common)[1]
+    parallel = _real_run_inputs(
+        tmp_path, *models, "here-p2", parallel=True, n_workers=2, **common
+    )[1]
+
+    assert sorted(serial) == list(range(count))
+    assert sorted(parallel) == list(range(count))
+    for index in range(count):
+        expected = _sampled_only(json.loads(serial[index]))
+        actual = _sampled_only(json.loads(parallel[index]))
+        assert len(expected) > 20, f"only {len(expected)} fields left to compare"
+        assert actual == expected, (
+            f"{multiprocessing.get_start_method()}: serial and parallel(2) "
+            f"differ at index {index}"
+        )
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("start_method", _available_start_methods())
 def test_the_real_parallel_path_is_worker_invariant_under_every_start_method(
@@ -690,6 +730,10 @@ def test_a_row_cut_off_mid_write_is_named_as_unreadable(
     That row is the corruption this check exists to find, so it is named and
     raised on. Skipping it and reporting the index as missing was a worse
     answer: with every expected index present, a corrupt file passed.
+
+    This run wrote the whole file, so the damage is its own. A run appending
+    onto a file an earlier run damaged is judged only on what it added, which
+    ``test_an_append_run_is_not_judged_on_the_damage_it_inherited`` covers.
     """
     montecarlo = MonteCarlo(
         filename=str(tmp_path / f"truncated-{parallel}"),
@@ -713,7 +757,7 @@ def test_a_row_cut_off_mid_write_is_named_as_unreadable(
         montecarlo, "_MonteCarlo__evaluate_flight_inputs", cut_the_second_short
     )
 
-    with pytest.raises(RuntimeError, match="not readable JSON"):
+    with pytest.raises(RuntimeError, match="cannot be read"):
         montecarlo.simulate(number_of_simulations=2, random_seed=5150, **kwargs)
 
 

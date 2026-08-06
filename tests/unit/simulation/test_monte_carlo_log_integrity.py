@@ -12,6 +12,7 @@ to survive that.
 
 import threading
 import types
+import warnings
 
 import pytest
 
@@ -41,12 +42,12 @@ COMPLETE = '{"index": 0}\n{"index": 1}\n'
 
 
 CORRUPT = {
-    "a row cut off mid-write": (COMPLETE + "{not json\n", "not readable JSON"),
-    "a row that is not an object": (COMPLETE + "[]\n", "does not carry"),
-    "a row with no index": (COMPLETE + '{"foo": 1}\n', "does not carry"),
-    "a boolean index": ('{"index": 0}\n{"index": true}\n', "does not carry"),
-    "a float index": ('{"index": 0}\n{"index": 1.0}\n', "does not carry"),
-    "a negative index": (COMPLETE + '{"index": -1}\n', "does not carry"),
+    "a row cut off mid-write": (COMPLETE + "{not json\n", "cannot be read"),
+    "a row that is not an object": (COMPLETE + "[]\n", "cannot be read"),
+    "a row with no index": (COMPLETE + '{"foo": 1}\n', "cannot be read"),
+    "a boolean index": ('{"index": 0}\n{"index": true}\n', "cannot be read"),
+    "a float index": ('{"index": 0}\n{"index": 1.0}\n', "cannot be read"),
+    "a negative index": (COMPLETE + '{"index": -1}\n', "cannot be read"),
     "an index past the run": (COMPLETE + '{"index": 99}\n', "outside the range"),
     "the same index twice": (COMPLETE + '{"index": 1}\n', "more than once"),
     "an index never written": ('{"index": 0}\n', "never written"),
@@ -65,6 +66,47 @@ def test_a_corrupt_log_is_not_a_successful_run(tmp_path, rows, expected):
     """
     with pytest.raises(RuntimeError, match=expected):
         _check(_runner(tmp_path, rows))
+
+
+def test_an_append_run_is_not_judged_on_the_damage_it_inherited(tmp_path):
+    """The documented way to reach an append is to interrupt a run, so the file
+    it appends to can hold a torn row or a pair that disagrees. Judging this run
+    on that made the very files append exists for the ones it refused.
+
+    Measured before the fix: all three of these were refused, so a file could be
+    damaged once and never resumed again.
+    """
+    new_rows = '{"index": 2}\n{"index": 3}\n'
+    inherited = {
+        "a duplicate": ('{"index": 0}\n{"index": 0}\n', None),
+        "a torn row": ('{"index": 0}\n{not json\n', None),
+        "files that disagree": ('{"index": 0}\n{"index": 1}\n', '{"index": 0}\n'),
+    }
+    for name, (history, other) in inherited.items():
+        runner = _runner(
+            tmp_path,
+            history + new_rows,
+            outputs=(other or history) + new_rows,
+            count=4,
+            initial=2,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _check(runner)  # must not raise, whatever the history looks like
+        assert True, name
+
+
+def test_this_run_is_still_judged_strictly_while_appending(tmp_path):
+    """The other half. Tolerating the history must not tolerate the rows this
+    run added, or appending would become a way to launder a bad run."""
+    runner = _runner(
+        tmp_path,
+        '{"index": 0}\n{"index": 2}\n{"index": 2}\n',
+        count=4,
+        initial=2,
+    )
+    with pytest.raises(RuntimeError, match="more than once"):
+        _check(runner)
 
 
 def test_a_complete_run_is_still_accepted(tmp_path):
