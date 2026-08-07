@@ -169,3 +169,54 @@ def test_the_air_brake_sample_follows_the_seed_not_the_call_order(
     assert first, "the air brake sampled nothing, so this proves nothing"
     assert drawn(31337) == first, "the same seed drew a different air brake"
     assert drawn(31338) != first, "a different seed drew the same air brake"
+
+
+def _mass_drawn_with(rocket_factory, stochastic_parachutes, seed=42):
+    rocket = rocket_factory()
+    for parachute in stochastic_parachutes:
+        rocket.add_parachute(parachute)
+    rocket._set_stochastic(seed)
+    return next(rocket.dict_generator())["mass"]
+
+
+@pytest.mark.parametrize("attached", [0, 1, 2])
+def test_attaching_components_does_not_move_the_rocket_body_stream(
+    attached,
+    stochastic_calisto,
+    stochastic_main_parachute,
+    stochastic_drogue_parachute,
+):
+    """The base generator walked the whole instance and drew from
+    ``parachutes`` too, using the model's own generator since this branch
+    started seeding list choices. The subclass then discards that draw, so the
+    only thing it did was shift every later draw by however many components
+    happened to be attached. Two chutes changed the sampled mass.
+
+    One is not enough to catch it: ``integers(1)`` has a single outcome and
+    NumPy returns it without consuming any state.
+    """
+    available = [stochastic_main_parachute, stochastic_drogue_parachute]
+
+    def bare():
+        stochastic_calisto.parachutes = []
+        stochastic_calisto.air_brakes = []
+        return stochastic_calisto
+
+    alone = _mass_drawn_with(bare, [])
+    with_components = _mass_drawn_with(bare, available[:attached])
+
+    assert with_components == alone
+
+
+def test_the_discarded_component_lists_are_still_reported_empty(
+    stochastic_calisto, stochastic_main_parachute
+):
+    """Skipping them must not change what ``dict_generator`` yields."""
+    stochastic_calisto.parachutes = []
+    stochastic_calisto.add_parachute(stochastic_main_parachute)
+    stochastic_calisto._set_stochastic(42)
+
+    generated = next(stochastic_calisto.dict_generator())
+
+    assert generated["parachutes"] == []
+    assert generated["air_brakes"] == []
