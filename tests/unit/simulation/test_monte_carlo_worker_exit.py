@@ -238,3 +238,57 @@ def test_an_interrupted_run_is_not_then_reported_as_incomplete(
     assert parallel_runner.input_file.read_text() == "", (
         "nothing was written, so the check really was in a position to reject this"
     )
+
+
+class _Crashed:
+    """Killed outright: gone, non-zero exit code, no event set."""
+
+    def __init__(self):
+        self.exitcode = 7
+
+    def join(self, *_a, **_k):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+class _BlockedForever:
+    """Waiting on the lock the crashed worker still holds."""
+
+    def __init__(self, give_up_after=50):
+        self.exitcode = None
+        self.joins = 0
+        self._give_up_after = give_up_after
+
+    def join(self, *_a, **_k):
+        self.joins += 1
+        if self.joins > self._give_up_after:
+            raise AssertionError(
+                "the parent is still waiting on a worker that a dead sibling "
+                "has blocked, and nothing else will end this wait"
+            )
+
+    def is_alive(self):
+        return True
+
+
+def test_the_parent_stops_waiting_when_a_worker_dies_holding_the_lock():
+    """A worker killed outright sets no event, so the wait had only
+    ``is_alive`` to end it, and a sibling blocked on the lock it held kept that
+    true forever. The exit-code check downstream was never reached."""
+    crashed, blocked = _Crashed(), _BlockedForever()
+
+    mc._wait_for_workers([crashed, blocked], _Event())
+
+    assert blocked.is_alive(), "the blocked worker is meant to still be running"
+
+
+def test_the_shutdown_window_is_not_cut_short_by_a_worker_already_known_dead():
+    """The grace period exists so the survivors can finish their writes. It is
+    bounded by its own timeout, so a crash must not end it early."""
+    crashed, blocked = _Crashed(), _BlockedForever(give_up_after=10**6)
+
+    mc._wait_for_workers([crashed, blocked], timeout=0.3)
+
+    assert blocked.joins > 1, "the grace period returned without waiting"

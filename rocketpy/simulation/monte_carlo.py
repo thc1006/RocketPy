@@ -257,6 +257,16 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             _check_the_checkpoint_supports_appending(
                 self.input_file, self.output_file, self._initial_sim_idx
             )
+            # ``number_of_simulations`` is the target to reach, not a batch to
+            # add. Below the checkpoint it ran nothing, reported success, and
+            # left a file with more simulations than the caller had asked for.
+            if number_of_simulations < self._initial_sim_idx:
+                raise ValueError(
+                    f"number_of_simulations is the total to reach when "
+                    f"append=True. The checkpoint already holds "
+                    f"{self._initial_sim_idx} simulations, more than the "
+                    f"requested {number_of_simulations}."
+                )
         # Both run paths catch Ctrl-C, save what they have and return, so a
         # stopped run is incomplete on purpose and the completeness check below
         # has to know the difference between that and a worker going missing.
@@ -607,7 +617,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # os.cpu_count() is documented as possibly None, and comparing against
         # it then raises rather than falling back to a usable default.
         available = os.cpu_count() or 2
-        if n_workers is not None and type(n_workers) not in (int, np.integer):  # noqa: E721
+        if n_workers is not None and not _is_whole_number(n_workers):
             raise TypeError(
                 f"Number of workers must be an integer, not {type(n_workers).__name__}."
             )
@@ -1985,14 +1995,25 @@ def _refuse_a_checkpoint_that_does_not_line_up(label, path, written, resume_at):
         )
 
 
+def _is_whole_number(value):
+    """A Python or NumPy integer, and not a bool.
+
+    ``type(value) in (int, np.integer)`` rejected every NumPy integer, because
+    ``type(np.int64(2))`` is ``np.int64``. ``True`` still has to go: it is an
+    ``int`` to ``isinstance`` and would quietly run one simulation.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    return isinstance(value, (int, np.integer))
+
+
 def _validate_simulation_count(number_of_simulations):
     """A count has to be a whole non-negative number, checked before any file.
 
-    ``type(...) is not int``: ``True`` is an ``int`` to ``isinstance`` and would
-    quietly run one simulation. A float ran ``int(count)`` of them and then
-    failed the completeness check with a range it could never have satisfied.
+    A float ran ``int(count)`` simulations and then failed the completeness
+    check with a range it could never have satisfied.
     """
-    if type(number_of_simulations) not in (int, np.integer):  # noqa: E721
+    if not _is_whole_number(number_of_simulations):
         raise TypeError(
             f"number_of_simulations must be an integer, not "
             f"{type(number_of_simulations).__name__}."
@@ -2033,6 +2054,20 @@ def _bring_the_fleet_down(started_processes, error_event):
     _stop_any_worker_still_running(started_processes)
 
 
+def _workers_that_crashed(started_processes):
+    """Those already known to have exited abnormally.
+
+    ``join(timeout=0)`` first: an unjoined child has no exit code yet, so it
+    would read as ``None`` and pass for one still running.
+    """
+    crashed = []
+    for process in started_processes:
+        process.join(timeout=0)
+        if process.exitcode not in (None, 0):
+            crashed.append(process)
+    return crashed
+
+
 def _wait_for_workers(started_processes, error_event=None, timeout=None):
     """Wait for the fleet, giving up early once one of them reports an error.
 
@@ -2047,6 +2082,11 @@ def _wait_for_workers(started_processes, error_event=None, timeout=None):
     deadline = None if timeout is None else monotonic() + timeout
     while any(process.is_alive() for process in started_processes):
         if error_event is not None and error_event.is_set():
+            break
+        # A worker killed outright sets no event. If it died holding the shared
+        # lock its siblings never return either, and only the unbounded wait
+        # has nothing else to end it.
+        if deadline is None and _workers_that_crashed(started_processes):
             break
         if deadline is not None and monotonic() >= deadline:
             break

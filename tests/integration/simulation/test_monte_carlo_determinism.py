@@ -902,3 +902,52 @@ def test_a_missing_parallel_dependency_does_not_cost_the_previous_run(
 
     with open(montecarlo.input_file, encoding="utf-8") as kept:
         assert kept.read() == "previous results\n"
+
+
+def test_appending_below_the_checkpoint_is_refused_and_changes_nothing(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+):
+    """``number_of_simulations`` is the total to reach, not a batch to add.
+
+    Asking for fewer than the checkpoint already holds ran nothing and returned
+    success: every index it wanted was present, so the completeness check was
+    satisfied by simulations an earlier run had made. The caller was told three
+    while the file held five.
+    """
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "shrunk"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    montecarlo.simulate(number_of_simulations=3, random_seed=606)
+    before = (
+        montecarlo.input_file.read_bytes(),
+        montecarlo.output_file.read_bytes(),
+    )
+
+    with pytest.raises(ValueError, match="already holds 3"):
+        montecarlo.simulate(number_of_simulations=2, append=True, random_seed=606)
+
+    assert (
+        montecarlo.input_file.read_bytes(),
+        montecarlo.output_file.read_bytes(),
+    ) == before, "the refusal touched the checkpoint it was protecting"
+
+
+def test_appending_to_the_size_it_already_has_is_allowed(
+    tmp_path, stochastic_environment, stochastic_calisto, stochastic_flight
+):
+    """The control. The guard must refuse only what is below the checkpoint,
+    not every append that adds no work."""
+    montecarlo = MonteCarlo(
+        filename=str(tmp_path / "unchanged"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+    )
+    montecarlo.simulate(number_of_simulations=2, random_seed=606)
+
+    montecarlo.simulate(number_of_simulations=2, append=True, random_seed=606)
+
+    assert sorted(_read_inputs_by_index(montecarlo.input_file)) == [0, 1]

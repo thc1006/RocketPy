@@ -36,6 +36,7 @@ import pytest
 from rocketpy.simulation import MonteCarlo
 from rocketpy.simulation.monte_carlo import (
     _SimMonitor,
+    _validate_simulation_count,
     _claim_next_index,
     _seed_sequence_to_int,
 )
@@ -326,3 +327,21 @@ def test_claim_next_index_hands_out_each_index_once_under_contention():
 
     assert sorted(claimed) == list(range(n_simulations))
     assert monitor.count == n_simulations
+
+
+@pytest.mark.parametrize("count", [3, np.int32(3), np.int64(3), np.uint64(3)], ids=str)
+def test_a_numpy_integer_is_a_valid_simulation_count(count):
+    """``type(count) in (int, np.integer)`` is False for every NumPy integer:
+    ``type(np.int64(3))`` is ``np.int64``, and ``np.integer`` is only its base.
+    A count read out of an array or a ``range`` product was refused."""
+    _validate_simulation_count(count)
+
+
+@pytest.mark.parametrize(
+    "count", [True, False, np.bool_(True), 3.0, "3", None], ids=str
+)
+def test_a_count_that_is_not_a_whole_number_is_still_refused(count):
+    """The control for the test above. ``True`` is the one that matters: it is
+    an ``int`` to ``isinstance`` and would quietly run one simulation."""
+    with pytest.raises(TypeError):
+        _validate_simulation_count(count)
