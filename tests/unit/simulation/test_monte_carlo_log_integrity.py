@@ -10,6 +10,7 @@ back has to be brought down in bounded time, and the failure that started it has
 to survive that.
 """
 
+import json
 import threading
 import types
 
@@ -470,3 +471,81 @@ def test_a_checkpoint_numbered_from_one_is_named_as_such(tmp_path):
     # from the old sequential scheme, not from this release's per-index one.
     assert "Renumbering" in str(raised.value)
     assert "without lining the seeds up" in str(raised.value)
+
+
+class _Collector:
+    """A model with only what the collector checks and the writer touch."""
+
+    export_list = ("apogee",)
+
+    def __init__(self, data_collector=None):
+        self.data_collector = data_collector
+        self._export_config = {}
+
+
+def _outputs(data_collector, sim_idx):
+    model = _Collector(data_collector)
+    flight = types.SimpleNamespace(apogee=100.0)
+    return json.loads(
+        mc.MonteCarlo._MonteCarlo__evaluate_flight_outputs(model, flight, sim_idx)
+    )
+
+
+def test_a_collector_cannot_relabel_the_row_it_is_attached_to():
+    """`index` pairs an inputs row with its outputs row. The custom fields used
+    to be merged over it, so a collector could file a row under a different
+    simulation than the one that produced it."""
+    labels = iter([1, 0])
+    collector = {"index": lambda _flight: next(labels)}
+
+    assert _outputs(collector, 0)["index"] == 0
+    assert _outputs(collector, 1)["index"] == 1
+
+
+def test_a_permutation_of_valid_indices_would_pass_every_other_check():
+    """Why the one above matters more than a malformed value would.
+
+    A collector returning `-1` writes a row the completeness check rejects. One
+    returning a permutation writes the same index set with the same counts, so
+    nothing downstream can tell the outputs are on the wrong simulations.
+    """
+    labels = iter([1, 0])
+    rows = [_outputs({"custom": lambda _f: next(labels)}, i) for i in (0, 1)]
+
+    assert sorted(r["index"] for r in rows) == [0, 1]
+    assert [r["custom"] for r in rows] == [1, 0], "the collector still runs"
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    [("index", "reserved"), (7, "must be strings"), (None, "must be strings")],
+    ids=["reserved-name", "int-key", "none-key"],
+)
+def test_a_collector_key_that_cannot_be_written_is_refused(key, expected):
+    with pytest.raises(ValueError, match=expected):
+        mc.MonteCarlo._check_data_collector(_Collector(), {key: lambda _f: 0})
+
+
+def test_a_collector_changed_after_construction_is_checked_again(tmp_path):
+    """`data_collector` is public and mutable, so validating it once in
+    ``__init__`` is not enough. The check has to run before ``__setup_files``
+    opens the logs "w+", or a rejected run destroys the previous one."""
+    inputs = tmp_path / "inputs.txt"
+    outputs = tmp_path / "outputs.txt"
+    inputs.write_text("previous input\n", encoding="utf-8")
+    outputs.write_text("previous output\n", encoding="utf-8")
+    runner = types.SimpleNamespace(
+        input_file=inputs,
+        output_file=outputs,
+        export_list=("apogee",),
+        data_collector={"index": lambda _flight: 0},
+        _check_data_collector=lambda collector: mc.MonteCarlo._check_data_collector(
+            runner, collector
+        ),
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        mc.MonteCarlo.simulate(runner, number_of_simulations=1, random_seed=42)
+
+    assert inputs.read_text(encoding="utf-8") == "previous input\n"
+    assert outputs.read_text(encoding="utf-8") == "previous output\n"

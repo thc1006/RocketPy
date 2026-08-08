@@ -40,6 +40,9 @@ from rocketpy.tools import (
 )
 
 # TODO: Create evolution plots to analyze convergence
+# Written by the run itself and used to pair an inputs row with its outputs row.
+# A collector that supplies one can relabel a row without tripping any check.
+_RESERVED_RECORD_KEYS = frozenset({"index"})
 
 
 class MonteCarlo:  # pylint: disable=too-many-public-methods
@@ -258,6 +261,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # __setup_files, which opens both logs "w+" and empties them. Raising
         # after that point destroys the previous run on the way out.
         _validate_simulation_count(number_of_simulations)
+        # Again rather than only in __init__: the attribute is public and a key
+        # added after construction would otherwise reach the logs unchecked.
+        self._check_data_collector(self.data_collector)
         if parallel:
             n_workers = self.__validate_number_of_workers(n_workers)
             # multiprocess is an optional extra. Imported here, an install
@@ -985,18 +991,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             export_item: getattr(flight, export_item)
             for export_item in self.export_list
         }
-        outputs_dict["index"] = sim_idx
-
         if self.data_collector is not None:
-            additional_exports = {}
             for key, callback in self.data_collector.items():
                 try:
-                    additional_exports[key] = callback(flight)
+                    outputs_dict[key] = callback(flight)
                 except Exception as e:
                     raise ValueError(
                         f"An error was encountered running 'data_collector' callback {key}. "
                     ) from e
-            outputs_dict = outputs_dict | additional_exports
+
+        # Last, so that the index a row is filed under is the one the run
+        # assigned even if the collector changed under a validated one.
+        outputs_dict["index"] = sim_idx
 
         return (
             json.dumps(outputs_dict, cls=RocketPyEncoder, **self._export_config) + "\n"
@@ -1140,6 +1146,17 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 )
 
             for key, callback in data_collector.items():
+                if not isinstance(key, str):
+                    raise ValueError(
+                        "Invalid 'data_collector' key! "
+                        f"Keys must be strings, not {type(key).__name__}."
+                    )
+                if key in _RESERVED_RECORD_KEYS:
+                    raise ValueError(
+                        f"Invalid 'data_collector' key '{key}'! "
+                        "That name is reserved for the record metadata that "
+                        "pairs an inputs row with its outputs row."
+                    )
                 if key in self.export_list:
                     raise ValueError(
                         "Invalid 'data_collector' key! "
