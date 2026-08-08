@@ -20,15 +20,17 @@ at all. List sampling is itself seeded now (it draws through the model generator
 not the stdlib ``random.choice``) and is covered directly in
 ``tests/unit/stochastic/test_stochastic_model``.
 
-Seed derivation being independent of the multiprocessing start method (fork,
-spawn or forkserver) is verified separately by
-``test_seed_derivation_is_start_method_invariant``, which uses a top-level
-picklable target so it is safe under ``spawn``/``forkserver`` -- unlike the
-``Flight``-stub test above, which reaches workers only under ``fork``.
+Two tests cover the start methods, both unmarked.
+``test_seed_derivation_is_start_method_invariant`` checks the derivation with a
+top-level picklable target, and
+``test_the_real_parallel_path_is_worker_invariant_under_every_start_method``
+drives the shipped parallel path. Both set the method rather than taking the
+platform default, which is worth the seconds it costs: ``multiprocess``
+hard-codes ``fork`` on every POSIX platform, macOS and 3.14 included, so a
+default-taking test would gate ``spawn`` on Windows and nothing anywhere else.
 """
 
 import json
-import multiprocessing
 import os
 from types import SimpleNamespace
 
@@ -48,10 +50,22 @@ from rocketpy.stochastic import (
 
 _child_seed = MonteCarlo._MonteCarlo__child_seed
 
+# Parametrizing over start methods runs while tests are collected, and
+# `multiprocess` is an optional extra, so skipping there would take the whole
+# module down instead of skipping it. The tests themselves still importorskip.
+try:
+    import multiprocess as _start_methods_from
+except ImportError:
+    import multiprocessing as _start_methods_from
+
 
 def _available_start_methods():
-    """The multiprocessing start methods this platform actually supports."""
-    supported = multiprocessing.get_all_start_methods()
+    """The start methods this platform supports, as ``multiprocess`` sees them.
+
+    Asked of ``multiprocess`` rather than the standard library, because that is
+    what creates the workers and the two do not have to agree.
+    """
+    supported = _start_methods_from.get_all_start_methods()
     return [method for method in ("fork", "spawn", "forkserver") if method in supported]
 
 
@@ -312,9 +326,8 @@ def test_seed_derivation_is_start_method_invariant(start_method):
     actually has to hold cross-platform -- that a simulation index maps to the same
     seed no matter which process derives it -- using a top-level picklable target
     and small picklable arguments, so it is valid under ``spawn``/``forkserver``
-    (Python 3.14's POSIX default) without relying on any inherited parent state.
-    Two workers split the indices; their combined result must equal the
-    single-process derivation.
+    without relying on any inherited parent state. Two workers split the indices;
+    their combined result must equal the single-process derivation.
     """
     root = np.random.SeedSequence(2718281828)
     root_state = (
@@ -326,7 +339,8 @@ def test_seed_derivation_is_start_method_invariant(start_method):
     indices = list(range(6))
     expected = _derive_index_seeds(root_state, indices)
 
-    context = multiprocessing.get_context(start_method)
+    multiprocess = pytest.importorskip("multiprocess")
+    context = multiprocess.get_context(start_method)
     chunks = [(root_state, indices[0::2]), (root_state, indices[1::2])]
     with context.Pool(2) as pool:
         results = pool.starmap(_derive_index_seeds, chunks)
@@ -503,47 +517,6 @@ def restore_start_method():
     multiprocess.set_start_method(original, force=True)
 
 
-def test_the_real_parallel_path_is_worker_invariant_on_this_platform(
-    tmp_path,
-    stochastic_environment_with_wind,
-    stochastic_calisto_numpy_only,
-    stochastic_flight,
-):
-    """The same property as the test below, on whatever start method this
-    platform uses, and without the ``slow`` marker.
-
-    The thorough version covers fork, spawn and forkserver, but it is marked
-    slow and pull-request CI skips slow tests, so the path this change exists
-    to support gated nothing. This one is small enough to run every time, and
-    because it takes the platform default, each CI job ends up gating the start
-    method it actually uses: spawn on Windows and macOS, forkserver on Python
-    3.14's POSIX default, fork below that.
-    """
-    count = 2
-    common = {"number_of_simulations": count, "random_seed": 24680}
-    models = (
-        stochastic_environment_with_wind,
-        stochastic_calisto_numpy_only,
-        stochastic_flight,
-    )
-    serial = _real_run_inputs(tmp_path, *models, "here-serial", **common)[1]
-    parallel = _real_run_inputs(
-        tmp_path, *models, "here-p2", parallel=True, n_workers=2, **common
-    )[1]
-
-    assert sorted(serial) == list(range(count))
-    assert sorted(parallel) == list(range(count))
-    for index in range(count):
-        expected = _sampled_only(json.loads(serial[index]))
-        actual = _sampled_only(json.loads(parallel[index]))
-        assert len(expected) > 20, f"only {len(expected)} fields left to compare"
-        assert actual == expected, (
-            f"{multiprocessing.get_start_method()}: serial and parallel(2) "
-            f"differ at index {index}"
-        )
-
-
-@pytest.mark.slow
 @pytest.mark.parametrize("start_method", _available_start_methods())
 def test_the_real_parallel_path_is_worker_invariant_under_every_start_method(
     restore_start_method,
@@ -560,8 +533,14 @@ def test_the_real_parallel_path_is_worker_invariant_under_every_start_method(
     every start method, and the stubbed test above covers the real loop on
     ``fork``. Neither covers ``multiprocess.Process``, ``__sim_producer``, the
     manager proxies or pickling the stochastic object graph anywhere but
-    ``fork``, and that is what Windows, macOS and Python 3.14's POSIX default
-    actually run.
+    ``fork``.
+
+    Sets each method rather than taking the platform default, because
+    ``multiprocess`` hard-codes ``fork`` on every POSIX platform including macOS
+    and 3.14, so a default-taking test gates ``spawn`` on Windows and nothing
+    else. Unmarked despite the cost: 26 s for the three, against 89 s for the
+    rest of this directory, and it is the only thing covering the path this
+    change exists to support.
     """
     multiprocess = restore_start_method
     if start_method not in multiprocess.get_all_start_methods():
