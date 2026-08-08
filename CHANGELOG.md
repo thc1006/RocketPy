@@ -39,13 +39,13 @@ Attention: The newest changes should be on top -->
 - ENH: Add Qodo PR-Agent workflow using Google Gemini [#1089](https://github.com/RocketPy-Team/RocketPy/pull/1089)
 - ENH: Support for Meteomatics API in the `Environment` class [#1079](https://github.com/RocketPy-Team/RocketPy/pull/1079)
 - ENH: update master with develop [#1081](https://github.com/RocketPy-Team/RocketPy/pull/1081)
-- ENH: reproducible Monte Carlo runs via a random_seed argument [#1054](https://github.com/RocketPy-Team/RocketPy/pull/1054)
 
 ### Changed
 
 - CI: make the Gemini PR reviewer actually review [#1140](https://github.com/RocketPy-Team/RocketPy/pull/1140)
 - MNT: declare dependency floors the package can actually run on [#1108](https://github.com/RocketPy-Team/RocketPy/pull/1108)
 - CI: build the docs for pull requests into develop as well [#1104](https://github.com/RocketPy-Team/RocketPy/pull/1104)
+- ENH: Make Monte Carlo input sampling reproducible per simulation index via a `random_seed` argument. Fixed-seed samples change, serial log indices are now zero-based to match the parallel path, and checkpoints written by the previous scheme cannot be resumed. [#1054](https://github.com/RocketPy-Team/RocketPy/pull/1054)
 - CI: make changelog automation LLM-based (Gemini) and race-safe [#1082](https://github.com/RocketPy-Team/RocketPy/pull/1082)
 - ENH: Resolve pressure_ISA discretization bounds TODO [#1056](https://github.com/RocketPy-Team/RocketPy/pull/1056)
 

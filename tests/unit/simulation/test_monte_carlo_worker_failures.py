@@ -350,3 +350,80 @@ def test_a_committed_row_is_not_reported_as_unfinished(tmp_path, monkeypatch):
     record = json.loads(runner.error_file.read_text(encoding="utf-8").splitlines()[0])
     assert record == {"index": 0, "error": record["error"]}
     assert "_Boom" in record["error"]
+
+
+class _ClaimOnceThenFail:
+    """Lets one simulation through, then fails the progress call."""
+
+    def __init__(self):
+        self.count = 0
+
+    def keep_simulating(self):
+        return self.count < 1
+
+    def increment(self):
+        self.count += 1
+        return self.count
+
+    def print_update_status(self):
+        raise _Boom("progress failed")
+
+
+def test_a_worker_progress_failure_does_not_repeat_committed_inputs(tmp_path):
+    """The serial path clears its payload once the pair is on disk. The worker
+    kept it, so a failure in the progress call wrote the same sampled inputs to
+    the error file and one simulation appeared in the logs and the failures."""
+    worker = _worker(
+        tmp_path,
+        _MonteCarlo__evaluate_flight_inputs=lambda index: '{"index": 0, "drew": 42}\n',
+        _MonteCarlo__evaluate_flight_outputs=lambda flight, index: '{"index": 0}\n',
+    )
+    mutex, event = _RecordingMutex(), _Event()
+
+    with pytest.raises(_Boom, match="progress failed"):
+        mc.MonteCarlo._MonteCarlo__sim_producer(
+            worker, _ClaimOnceThenFail(), mutex, event
+        )
+
+    committed = json.loads(
+        worker.input_file.read_text(encoding="utf-8").splitlines()[0]
+    )
+    failure = json.loads(worker.error_file.read_text(encoding="utf-8").splitlines()[0])
+
+    assert committed == {"index": 0, "drew": 42}
+    assert "drew" not in failure, failure
+    assert "_Boom" in failure["error"]
+
+
+def test_a_serial_reporting_failure_does_not_replace_the_original(
+    tmp_path, monkeypatch
+):
+    """The worker guards its own error write. Serial did not, so an unwritable
+    error file raised OSError in place of the failure it was recording."""
+    runner = _serial_runner(
+        tmp_path,
+        monkeypatch,
+        _OneThenStop(),
+        _MonteCarlo__evaluate_flight_outputs=_raise,
+    )
+    real_open = open
+
+    def refuse_the_error_file(path, *args, **kwargs):
+        if str(path) == str(runner.error_file):
+            raise OSError("error disk unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", refuse_the_error_file)
+
+    with pytest.warns(RuntimeWarning, match="could not be written"):
+        with pytest.raises(_Boom, match="injected"):
+            mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
+
+
+def test_a_shutdown_failure_does_not_replace_the_error_it_is_handling(monkeypatch):
+    """``_bring_the_fleet_down`` promised not to raise over the failure being
+    handled, but only the event was guarded. The two waits below it were not."""
+    monkeypatch.setattr(mc, "_wait_for_workers", _raise)
+
+    with pytest.warns(RuntimeWarning, match="graceful worker wait"):
+        mc._bring_the_fleet_down([], _Event())

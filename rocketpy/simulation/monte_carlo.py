@@ -540,14 +540,24 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
         except Exception as error:
             print(f"Error on iteration {sim_monitor.count}: {error}")
-            _record_failure(self._error_file, sim_idx, inputs_json)
+            # Captured before reporting, which may fail and must not be what
+            # gets recorded or raised.
+            _record_failure(
+                self._error_file, sim_idx, inputs_json, traceback.format_exc()
+            )
             # Bare, so the handler's own line does not join the traceback.
             raise
 
     def __keep_the_inputs_that_did_not_finish(self, inputs_json):
-        """Append the inputs of a simulation that stopped part way through."""
-        with open(self._error_file, "a", encoding="utf-8") as f:
-            f.write(inputs_json)
+        """Append the inputs of a simulation that stopped part way through.
+
+        Best effort: an unwritable error file must not turn a clean interrupt
+        into a crash.
+        """
+        _best_effort(
+            lambda: _write_unfinished_inputs(self._error_file, inputs_json),
+            "interrupted simulation inputs",
+        )
 
     def __run_in_parallel(self, n_workers=None):
         """
@@ -593,39 +603,30 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 # so the sampled inputs do not depend on the number of workers.
                 # The root state is small and travels with the pickled instance,
                 # so no per-index seed list is materialized or sent.
-                for _ in range(n_workers):
-                    sim_producer = multiprocess.Process(
-                        target=self.__sim_producer,
-                        args=(
-                            sim_monitor,
-                            mutex,
-                            simulation_error_event,
-                        ),
-                    )
-                    sim_producer.start()
-                    started_processes.append(sim_producer)
-
-                _wait_for_workers(started_processes, simulation_error_event)
-                # The event asks them to stop, it does not stop them. Without
-                # this window a worker part way through a write is cut off and
-                # leaves exactly the torn row the check below would report.
-                # Not _bring_the_fleet_down: that sets the event, which on a run
-                # that finished cleanly is what the crash check reads next.
-                _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
-                _stop_any_worker_still_running(started_processes)
-                _fail_if_a_worker_did_not_finish(
-                    started_processes, simulation_error_event, self.error_file
+                _start_the_fleet(
+                    multiprocess,
+                    self.__sim_producer,
+                    n_workers,
+                    (sim_monitor, mutex, simulation_error_event),
+                    started_processes,
                 )
 
+                _wait_for_workers(started_processes, simulation_error_event)
+                _close_the_fleet_down(
+                    started_processes, simulation_error_event, self.error_file
+                )
                 sim_monitor.print_final_status()
 
-            # Handle error from the main process
-            # pylint: disable=broad-except
-            except (Exception, KeyboardInterrupt) as error:
+            except KeyboardInterrupt:
                 _bring_the_fleet_down(started_processes, simulation_error_event)
-                self._interrupted = isinstance(error, KeyboardInterrupt)
-                if not self._interrupted:
-                    raise error
+                self._interrupted = True
+
+            # Handle error from the main process
+            except Exception:
+                _bring_the_fleet_down(started_processes, simulation_error_event)
+                self._interrupted = False
+                # Bare, so the handler's own line does not join the traceback.
+                raise
             finally:
                 _stop_any_worker_still_running(started_processes)
 
@@ -694,6 +695,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     _record_simulation(
                         self.input_file, self.output_file, inputs_json, outputs_json
                     )
+                    # Same as the serial path: the pair is on disk, so a failure
+                    # in the monitor call below must report itself and not the
+                    # row that has just been committed.
+                    inputs_json, outputs_json = "", ""
                     sim_monitor.print_update_status()
                 finally:
                     if acquired:
@@ -2052,14 +2057,23 @@ def _record_simulation(input_file, output_file, inputs_json, outputs_json):
         f.write(outputs_json)
 
 
-def _record_failure(error_file, sim_idx, inputs_json):
+def _record_failure(error_file, sim_idx, inputs_json, details):
     """Append the failure being handled, the way the workers record theirs.
 
-    Module level for the same reason as ``_record_simulation``: the run paths
-    are driven by stub objects in the tests, which carry no private methods.
+    Best effort, and it says so rather than going quiet: an unwritable error
+    file must not become the exception the caller sees in place of the one it
+    was called to record.
     """
-    with open(error_file, "a", encoding="utf-8") as handle:
-        handle.write(_build_error_record(sim_idx, inputs_json, traceback.format_exc()))
+    try:
+        with open(error_file, "a", encoding="utf-8") as handle:
+            handle.write(_build_error_record(sim_idx, inputs_json, details))
+    except Exception as reporting_error:  # pylint: disable=broad-exception-caught
+        warnings.warn(
+            f"The simulation failed and its error record could not be written: "
+            f"{reporting_error!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _build_error_record(sim_idx, inputs_json, details):
@@ -2076,19 +2090,66 @@ def _build_error_record(sim_idx, inputs_json, details):
     return json.dumps(record) + "\n"
 
 
+def _start_the_fleet(multiprocess, target, n_workers, args, started_processes):
+    """Start the workers, appending each as it starts.
+
+    Appended one at a time so a ``start()`` that fails part way through leaves
+    the caller holding exactly those already running.
+    """
+    for _ in range(n_workers):
+        sim_producer = multiprocess.Process(target=target, args=args)
+        sim_producer.start()
+        started_processes.append(sim_producer)
+
+
+def _close_the_fleet_down(started_processes, error_event, error_file):
+    """Let the fleet finish its writes, stop the rest, then check the logs.
+
+    The event asks workers to stop, it does not stop them, and without this
+    window one part way through a write is cut off and leaves exactly the torn
+    row the check reports. Not ``_bring_the_fleet_down``: that sets the event,
+    which on a clean run is what the crash check reads next.
+    """
+    _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
+    _stop_any_worker_still_running(started_processes)
+    _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file)
+
+
 def _bring_the_fleet_down(started_processes, error_event):
     """Stop everything, without raising over the failure being handled.
 
-    Setting the event is best effort like the workers' own reporting: the
-    manager may be the thing that died. Then a bounded window to notice it and
-    leave, and whatever is left gets stopped.
+    Every step is best effort, not only the event: the manager may be the thing
+    that died, and a shutdown that raises would replace the failure that started
+    it. Bounded window to notice, then whatever is left gets stopped.
     """
+    _best_effort(error_event.set, "error notification")
+    _best_effort(
+        lambda: _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE),
+        "graceful worker wait",
+    )
+    _best_effort(
+        lambda: _stop_any_worker_still_running(started_processes),
+        "forced worker shutdown",
+    )
+
+
+def _write_unfinished_inputs(error_file, inputs_json):
+    """Module level for the same reason as ``_record_simulation``: the run paths
+    are driven by stub objects in the tests, which carry no private methods."""
+    with open(error_file, "a", encoding="utf-8") as f:
+        f.write(inputs_json)
+
+
+def _best_effort(action, description):
+    """Run one shutdown step, reporting a failure rather than raising it."""
     try:
-        error_event.set()
-    except Exception:  # pylint: disable=broad-exception-caught
-        pass
-    _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
-    _stop_any_worker_still_running(started_processes)
+        action()
+    except Exception as cleanup_error:  # pylint: disable=broad-exception-caught
+        warnings.warn(
+            f"Worker cleanup failed during {description}: {cleanup_error!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _workers_that_crashed(started_processes):

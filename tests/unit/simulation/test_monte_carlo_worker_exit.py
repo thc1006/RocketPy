@@ -7,6 +7,7 @@ under spawn, or the error handler of the worker itself failing. The exit status
 is what separates those from a clean finish.
 """
 
+import traceback
 import types
 from contextlib import contextmanager
 from time import monotonic, sleep
@@ -346,3 +347,27 @@ def test_shutdown_does_not_grow_with_the_fleet():
         f"six workers were granted {crowd:.2f}s against {alone:.2f}s for one, "
         f"so the wait is still scaling with the fleet"
     )
+
+
+def test_the_parent_does_not_repeat_its_own_frame_in_the_traceback(
+    parallel_runner, monkeypatch
+):
+    """``raise error`` names the exception again, so the handler's line joins the
+    traceback and the reader walks past it. The serial path already re-raises
+    bare; this is the parent doing the same.
+
+    On the duplicate rather than the original frame: the failing call survives
+    either spelling, so asserting it is there passes both.
+    """
+
+    def start_then_fail(self):
+        raise OSError("cannot start")
+
+    monkeypatch.setattr(_Process, "start", start_then_fail)
+
+    with pytest.raises(OSError) as raised:
+        mc.MonteCarlo._MonteCarlo__run_in_parallel(parallel_runner, n_workers=2)
+
+    frames = [frame.name for frame in traceback.extract_tb(raised.value.__traceback__)]
+    assert "start_then_fail" in frames, frames
+    assert frames.count("__run_in_parallel") == 1, frames
