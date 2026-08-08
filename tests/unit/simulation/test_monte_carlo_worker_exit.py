@@ -316,28 +316,33 @@ class _Stubborn:
         pass
 
 
-@pytest.mark.parametrize("fleet_size", [1, 6])
-def test_shutdown_is_bounded_by_the_grace_period_not_by_the_fleet_size(fleet_size):
+def _granted_shutting_down(fleet_size, grace):
+    """How long the fleet was granted in total, across both phases."""
+    waits = []
+    mc._stop_any_worker_still_running(
+        [_Stubborn(waits) for _ in range(fleet_size)], grace=grace
+    )
+    assert len(waits) == 2 * fleet_size, "every worker is still waited on"
+    return sum(waits)
+
+
+def test_shutdown_does_not_grow_with_the_fleet():
     """Each worker used to get the full grace to itself, so the wait scaled with
     the fleet: six stubborn workers held the parent for six grace periods per
-    phase rather than one. The deadline is shared now, so a larger fleet costs
-    the same wall clock as a single worker.
+    phase rather than one.
+
+    Compares two fleet sizes rather than checking either against the grace.
+    A single fleet has to be measured against a constant, and the slack that
+    needs is the machine's timer granularity, which on Windows is 15 ms against
+    a 200 ms grace. Both measurements carry the same granularity, so comparing
+    them cancels it.
     """
     grace = 0.2
-    waits = []
-    fleet = [_Stubborn(waits) for _ in range(fleet_size)]
 
-    mc._stop_any_worker_still_running(fleet, grace=grace)
+    alone = _granted_shutting_down(1, grace)
+    crowd = _granted_shutting_down(6, grace)
 
-    assert len(waits) == 2 * fleet_size, "every worker is still waited on"
-    # What each worker was granted, rather than how long the call took, so a
-    # loaded machine cannot turn this into a flake. Per phase the total is one
-    # grace however many workers there are; it was one grace each.
-    for phase, granted in (
-        ("terminate", waits[:fleet_size]),
-        ("kill", waits[fleet_size:]),
-    ):
-        assert sum(granted) <= grace + 0.01, (
-            f"{phase}: {fleet_size} workers were granted {sum(granted):.2f}s "
-            f"against a {grace}s deadline"
-        )
+    assert crowd < alone * 2, (
+        f"six workers were granted {crowd:.2f}s against {alone:.2f}s for one, "
+        f"so the wait is still scaling with the fleet"
+    )
