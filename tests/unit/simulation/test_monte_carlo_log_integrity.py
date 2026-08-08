@@ -522,6 +522,13 @@ def test_a_permutation_of_valid_indices_would_pass_every_other_check():
     ids=["reserved-name", "int-key", "none-key"],
 )
 def test_a_collector_key_that_cannot_be_written_is_refused(key, expected):
+    """A non-string key does not survive the round trip these files exist for.
+
+    ``json.dumps`` stringifies it on the way out, so ``7`` comes back as
+    ``"7"``, ``None`` as ``"null"``. Worse, it can collide: a collector holding
+    both ``1`` and ``"1"`` writes ``{"1": ..., "1": ...}``, and reading that
+    back leaves one column where there were two.
+    """
     with pytest.raises(ValueError, match=expected):
         mc.MonteCarlo._check_data_collector(_Collector(), {key: lambda _f: 0})
 

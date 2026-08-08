@@ -210,7 +210,23 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             runs it. The rows themselves are written in completion order, since
             a worker takes the log lock once its simulation is done, so the file
             order can differ between runs. Compare by the recorded index rather
-            than byte for byte. A supplied ``SeedSequence``
+            than byte for byte.
+
+            What is reproduced is the sampled values. With
+            ``include_function_data=True`` a record also carries a
+            ``Function``'s signature hash and serialised source, which describe
+            the object rather than the value drawn for it, so a run under
+            ``spawn`` or ``forkserver`` writes different ones for the same
+            inputs. Measured on a real run, six fields differ across that
+            boundary and all six are these. Pass
+            ``include_function_data=False`` when the records need to compare
+            field for field.
+
+            Reproducibility is also scoped to one environment. NumPy promises a
+            stream only for the same BitGenerator, seed, call sequence, build
+            and machine, and reserves the right to change what ``default_rng``
+            returns. A seed fixes the lineage of a run; it is not an archive
+            format that survives a version bump. A supplied ``SeedSequence``
             is copied from its full state rather than consumed, so repeated calls
             with the same seed reproduce the same inputs. Each model is reseeded
             with a 128-bit integer -- the seed type a custom sampler's
