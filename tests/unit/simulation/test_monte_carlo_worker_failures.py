@@ -9,6 +9,7 @@ raised ``UnboundLocalError`` over the real error while holding the mutex, and
 """
 
 import json
+import traceback
 import threading
 import types
 
@@ -254,3 +255,98 @@ def test_an_unreachable_error_event_does_not_replace_the_failure_it_reports(
         )
 
     assert mutex.acquired == mutex.released, "the mutex was left held"
+
+
+class _OneThenStop:
+    """A monitor that allows exactly one simulation, then whatever is asked."""
+
+    def __init__(self, on_update=None):
+        self.count = 0
+        self._on_update = on_update
+
+    def keep_simulating(self):
+        return self.count < 1
+
+    def increment(self):
+        self.count += 1
+        return self.count
+
+    def print_update_status(self):
+        if self._on_update is not None:
+            self._on_update()
+
+    def print_final_status(self):
+        pass
+
+
+def _serial_runner(tmp_path, monkeypatch, monitor, **overrides):
+    """A stand-in carrying only what ``__run_in_serial`` touches."""
+    runner = _worker(tmp_path, **overrides)
+    runner._error_file = runner.error_file
+    runner._initial_sim_idx = 0
+    runner.number_of_simulations = 1
+    runner._interrupted = False
+    runner._MonteCarlo__keep_the_inputs_that_did_not_finish = lambda payload: (
+        runner.error_file.open("a", encoding="utf-8").write(payload)
+    )
+    monkeypatch.setattr(mc, "_SimMonitor", lambda **_kwargs: monitor)
+    return runner
+
+
+def test_a_serial_failure_records_the_traceback_not_only_the_inputs(
+    tmp_path, monkeypatch
+):
+    """The worker path writes `{index, ...inputs, error: traceback}`. Serial
+    wrote the inputs alone, so a failure after sampling named which inputs
+    failed and never why, in the file the run points the user at."""
+    runner = _serial_runner(
+        tmp_path,
+        monkeypatch,
+        _OneThenStop(),
+        _MonteCarlo__evaluate_flight_outputs=_raise,
+    )
+
+    with pytest.raises(_Boom):
+        mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
+
+    record = json.loads(runner.error_file.read_text(encoding="utf-8").splitlines()[0])
+    assert "_Boom" in record["error"]
+    assert "injected" in record["error"]
+
+
+def test_a_serial_failure_does_not_repeat_the_handler_frame(tmp_path, monkeypatch):
+    """`raise error` names the exception again, so the handler's own line joins
+    the traceback and the reader walks past it to reach the real one. A bare
+    `raise` leaves the frame it came from.
+
+    On the duplicate rather than on the original frame: the failing call
+    survives either way, so asserting it is there passes both spellings.
+    """
+    runner = _serial_runner(
+        tmp_path,
+        monkeypatch,
+        _OneThenStop(),
+        _MonteCarlo__evaluate_flight_outputs=_raise,
+    )
+
+    with pytest.raises(_Boom) as raised:
+        mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
+
+    frames = [frame.name for frame in traceback.extract_tb(raised.value.__traceback__)]
+    assert "_raise" in frames, frames
+    assert frames.count("__run_in_serial") == 1, frames
+
+
+def test_a_committed_row_is_not_reported_as_unfinished(tmp_path, monkeypatch):
+    """The pair is on disk before the progress call. A failure there used to
+    append those same inputs to the error file, so one simulation appeared in
+    both the inputs log and the failures."""
+    runner = _serial_runner(tmp_path, monkeypatch, _OneThenStop(on_update=_raise))
+
+    with pytest.raises(_Boom):
+        mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
+
+    assert runner.input_file.read_text(encoding="utf-8").strip() == "{}"
+    record = json.loads(runner.error_file.read_text(encoding="utf-8").splitlines()[0])
+    assert record == {"index": 0, "error": record["error"]}
+    assert "_Boom" in record["error"]

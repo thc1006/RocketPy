@@ -185,8 +185,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         number_of_simulations : int
             Number of simulations to be run, must be non-negative.
         append : bool, optional
-            If True, the results will be appended to the existing files. If
-            False, the files will be overwritten. Default is False.
+            If True, resume the existing files. ``number_of_simulations`` is
+            then the target total rather than a number to add, and a value
+            below what the files already hold is refused. The root seed is not
+            stored in them, so pass the same ``random_seed`` to keep the
+            streams. If False, the files will be overwritten. Default is False.
         parallel : bool, optional
             If True, the simulations will be run in parallel. Default is False.
         n_workers : int, optional
@@ -500,6 +503,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             n_simulations=self.number_of_simulations,
             start_time=time(),
         )
+        # Bound before the loop: a failure on the very first iteration
+        # would otherwise reach the error record with no index at all.
+        sim_idx = self._initial_sim_idx
         try:
             while True:
                 # First statement in the loop, so it is bound before the two
@@ -519,6 +525,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 _record_simulation(
                     self.input_file, self.output_file, inputs_json, outputs_json
                 )
+                # The pair is on disk. Cleared before the monitor call so a
+                # failure there reports itself rather than reporting a row that
+                # has already been committed as one that never finished.
+                inputs_json = ""
                 sim_monitor.print_update_status()
 
             sim_monitor.print_final_status()
@@ -530,8 +540,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
         except Exception as error:
             print(f"Error on iteration {sim_monitor.count}: {error}")
-            self.__keep_the_inputs_that_did_not_finish(inputs_json)
-            raise error
+            _record_failure(self._error_file, sim_idx, inputs_json)
+            # Bare, so the handler's own line does not join the traceback.
+            raise
 
     def __keep_the_inputs_that_did_not_finish(self, inputs_json):
         """Append the inputs of a simulation that stopped part way through."""
@@ -698,15 +709,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 pass
             details = traceback.format_exc()
 
-            # The failure goes onto the inputs record rather than replacing it.
-            # Writing one or the other dropped the traceback for every failure
-            # after sampling, from the file the run tells the user to read.
-            try:
-                record = json.loads(inputs_json) if inputs_json else {"index": sim_idx}
-            except ValueError:
-                record = {"index": sim_idx}
-            record["error"] = details
-            record = json.dumps(record) + "\n"
+            # The failure goes onto the inputs record rather than replacing it,
+            # the same shape the serial path writes.
+            record = _build_error_record(sim_idx, inputs_json, details)
 
             acquired = False
             try:
@@ -2045,6 +2050,30 @@ def _record_simulation(input_file, output_file, inputs_json, outputs_json):
         f.write(inputs_json)
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(outputs_json)
+
+
+def _record_failure(error_file, sim_idx, inputs_json):
+    """Append the failure being handled, the way the workers record theirs.
+
+    Module level for the same reason as ``_record_simulation``: the run paths
+    are driven by stub objects in the tests, which carry no private methods.
+    """
+    with open(error_file, "a", encoding="utf-8") as handle:
+        handle.write(_build_error_record(sim_idx, inputs_json, traceback.format_exc()))
+
+
+def _build_error_record(sim_idx, inputs_json, details):
+    """One failed simulation as a row: what it drew, and what went wrong.
+
+    The traceback goes onto the inputs rather than replacing them, so the file
+    the run tells the user to read says both which inputs failed and why.
+    """
+    try:
+        record = json.loads(inputs_json) if inputs_json else {"index": sim_idx}
+    except (TypeError, ValueError):
+        record = {"index": sim_idx}
+    record["error"] = details
+    return json.dumps(record) + "\n"
 
 
 def _bring_the_fleet_down(started_processes, error_event):
