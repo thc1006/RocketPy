@@ -1,6 +1,10 @@
 name: Populate Changelog
 on:
-  pull_request:
+  # `pull_request_target`, not `pull_request`: secrets are withheld from a
+  # `pull_request` run whose head is a fork, so RELEASE_TOKEN arrived empty and
+  # the checkout below failed for every outside contribution. Nothing here runs
+  # code from the pull request, only the trusted tree checked out below.
+  pull_request_target:
     types: [closed]
     branches:
       - develop
