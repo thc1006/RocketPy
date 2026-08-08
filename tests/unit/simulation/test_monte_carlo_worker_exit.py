@@ -455,3 +455,51 @@ def _raiser(exception, message):
         raise exception(message)
 
     return raise_it
+
+
+class _ExitedWorker:
+    """A worker that already left, and did not leave cleanly."""
+
+    name = "worker-0"
+    exitcode = 7
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        pass
+
+
+class _SetEvent:
+    def is_set(self):
+        return True
+
+
+class _DeadEvent:
+    def is_set(self):
+        raise ConnectionResetError("manager is gone")
+
+
+def test_cleanup_failure_does_not_hide_which_worker_crashed(monkeypatch):
+    """The close path ran the wait and the forced stop raw, so a failure there
+    reached the caller before anything looked at the exit codes. The worker
+    result is the verdict on the run; housekeeping is not."""
+    monkeypatch.setattr(
+        mc, "_stop_any_worker_still_running", _raiser(OSError, "cleanup failed")
+    )
+
+    with pytest.warns(RuntimeWarning, match="forced worker shutdown"):
+        with pytest.raises(RuntimeError, match="exited with 7"):
+            mc._close_the_fleet_down([_ExitedWorker()], _SetEvent(), "errors.txt")
+
+
+def test_an_unreachable_event_is_reported_rather_than_raised():
+    """``error_event.is_set() or crashed`` asked the proxy first, so a dead
+    manager threw before the crash list was ever read."""
+    with pytest.raises(RuntimeError) as raised:
+        mc._fail_if_a_worker_did_not_finish(
+            [_ExitedWorker()], _DeadEvent(), "errors.txt"
+        )
+
+    assert "exited with 7" in str(raised.value)
+    assert "became unavailable" in str(raised.value)

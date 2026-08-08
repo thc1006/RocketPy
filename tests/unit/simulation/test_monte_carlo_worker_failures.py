@@ -456,3 +456,63 @@ def test_reporting_a_failure_cannot_escape_when_warnings_are_errors(
 
         with pytest.raises(_Boom, match="injected"):
             mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
+
+
+class _MutexDiesAfter(_RecordingMutex):
+    """Releases cleanly a few times, then the manager connection goes.
+
+    A mutex that fails on every release is the wrong model: the first clean
+    claim would fail on its own release, before there is anything to mask.
+    """
+
+    def __init__(self, healthy_releases=1):
+        super().__init__()
+        self._left = healthy_releases
+
+    def release(self):
+        super().release()
+        self._left -= 1
+        if self._left < 0:
+            raise BrokenPipeError("[Errno 32] Broken pipe")
+
+
+def test_a_dying_mutex_does_not_replace_the_simulation_failure(tmp_path):
+    """The release in the critical section used to run raw in ``finally``, so a
+    manager that died while the lock was held handed the caller its own
+    BrokenPipeError and left the real failure as context."""
+    worker = _worker(tmp_path)
+    monitor = _ClaimOnceThenFail()
+    event = _Event()
+
+    with pytest.warns(RuntimeWarning, match="manager mutex release"):
+        with pytest.raises(_Boom, match="progress failed"):
+            mc.MonteCarlo._MonteCarlo__sim_producer(
+                worker, monitor, _MutexDiesAfter(healthy_releases=1), event
+            )
+
+
+def test_a_dying_mutex_does_not_replace_the_claim_failure():
+    """Same shape one level down, where the claim itself is what fails."""
+
+    class _ClaimRaises:
+        def keep_simulating(self):
+            raise _Boom("claim failed")
+
+    with pytest.warns(RuntimeWarning, match="manager mutex release"):
+        with pytest.raises(_Boom, match="claim failed"):
+            mc._claim_next_index(_ClaimRaises(), _MutexDiesAfter(healthy_releases=0))
+
+
+def test_a_release_that_fails_on_its_own_is_still_raised():
+    """The other half. With nothing in flight a broken release is the failure,
+    not a warning, so the run does not carry on against a dead manager."""
+
+    class _Fine:
+        def keep_simulating(self):
+            return True
+
+        def increment(self):
+            return 1
+
+    with pytest.raises(BrokenPipeError):
+        mc._claim_next_index(_Fine(), _MutexDiesAfter(healthy_releases=0))

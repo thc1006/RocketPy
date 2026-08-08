@@ -18,6 +18,7 @@ import json
 import os
 import traceback
 import warnings
+from contextlib import contextmanager
 from copy import deepcopy
 from numbers import Real
 from pathlib import Path
@@ -679,10 +680,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
-                acquired = False
-                try:
-                    mutex.acquire()
-                    acquired = True
+                with _manager_mutex(mutex):
                     if error_event.is_set():
                         # Runs in a worker process spawned via multiprocessing:
                         # logging handlers configured in the main process are
@@ -705,9 +703,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     # row that has just been committed.
                     inputs_json, outputs_json = "", ""
                     sim_monitor.print_update_status()
-                finally:
-                    if acquired:
-                        mutex.release()
 
         except Exception:
             # Set first, so a parent waiting on the join learns why. Best effort
@@ -723,23 +718,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             # the same shape the serial path writes.
             record = _build_error_record(sim_idx, inputs_json, details)
 
-            acquired = False
             try:
-                mutex.acquire()
-                acquired = True
-                with open(self.error_file, "a", encoding="utf-8") as f:
-                    f.write(record)
+                with _manager_mutex(mutex):
+                    with open(self.error_file, "a", encoding="utf-8") as f:
+                        f.write(record)
 
-                # See note above: must use print() to remain visible from a
-                # multiprocessing worker process.
-                _SimMonitor.reprint(f"Error on iteration {sim_idx}:\n{details}")
+                    # See note above: must use print() to remain visible from a
+                    # multiprocessing worker process.
+                    _SimMonitor.reprint(f"Error on iteration {sim_idx}:\n{details}")
             except Exception:  # pylint: disable=broad-exception-caught
                 # The mutex or the error file is unreachable too. Reporting is
                 # not worth losing the failure that started this.
                 pass
-            finally:
-                if acquired:
-                    mutex.release()
 
             # The worker exits non-zero, so the parent can tell a crash from a
             # clean finish rather than only from the error event.
@@ -2116,8 +2106,16 @@ def _close_the_fleet_down(started_processes, error_event, error_file):
     row the check reports. Not ``_bring_the_fleet_down``: that sets the event,
     which on a clean run is what the crash check reads next.
     """
-    _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE)
-    _stop_any_worker_still_running(started_processes)
+    # Best effort, so that housekeeping cannot report itself in place of the
+    # worker result below, which is the authoritative verdict on the run.
+    _best_effort(
+        lambda: _wait_for_workers(started_processes, timeout=_WORKER_SHUTDOWN_GRACE),
+        "graceful worker wait",
+    )
+    _best_effort(
+        lambda: _stop_any_worker_still_running(started_processes),
+        "forced worker shutdown",
+    )
     _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file)
 
 
@@ -2171,6 +2169,36 @@ def _best_effort(action, description):
         )
 
 
+@contextmanager
+def _manager_mutex(mutex):
+    """Hold a manager lock without letting its release replace a failure.
+
+    The proxy can die while the lock is held, and a raw release in ``finally``
+    then becomes the exception the caller sees rather than the one already on
+    its way out. A release that fails with nothing in flight is still raised.
+    """
+    mutex.acquire()
+    try:
+        yield
+    except BaseException:
+        _best_effort(mutex.release, "manager mutex release")
+        raise
+    else:
+        mutex.release()
+
+
+def _read_error_event(error_event):
+    """Whether a worker reported an error, and what went wrong asking.
+
+    An unreachable proxy is itself a reason to stop and to fail the run, so it
+    reads as reported rather than letting the exception past the crash list.
+    """
+    try:
+        return bool(error_event.is_set()), None
+    except Exception as event_error:  # pylint: disable=broad-exception-caught
+        return True, event_error
+
+
 def _workers_that_crashed(started_processes):
     """Those already known to have exited abnormally.
 
@@ -2203,7 +2231,7 @@ def _wait_for_workers(started_processes, error_event=None, timeout=None):
     """
     deadline = None if timeout is None else monotonic() + timeout
     while any(process.is_alive() for process in started_processes):
-        if error_event is not None and error_event.is_set():
+        if error_event is not None and _read_error_event(error_event)[0]:
             break
         # A worker killed outright sets no event. If it died holding the shared
         # lock its siblings never return either, and only the unbounded wait
@@ -2270,7 +2298,10 @@ def _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file)
         for sim_producer in started_processes
         if sim_producer.exitcode != 0
     ]
-    if error_event.is_set() or crashed:
+    reported, event_error = _read_error_event(error_event)
+    if event_error is not None:
+        crashed.append(f"the worker error event became unavailable: {event_error!r}")
+    if reported or crashed:
         raise RuntimeError(
             "An error occurred during the simulation. \n"
             + (f"Workers that did not exit cleanly: {crashed}. \n" if crashed else "")
@@ -2287,13 +2318,10 @@ def _claim_next_index(sim_monitor, mutex):
     either increments, and both then claim an index, running more simulations
     than were requested (and duplicating a simulation index).
     """
-    mutex.acquire()
-    try:
+    with _manager_mutex(mutex):
         if not sim_monitor.keep_simulating():
             return None
         return sim_monitor.increment() - 1
-    finally:
-        mutex.release()
 
 
 def _import_multiprocess():
