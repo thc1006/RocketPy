@@ -199,11 +199,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             A minimum of 2 workers is required for parallel mode.
             Default is None.
         random_seed : int, numpy integer, sequence of ints, or SeedSequence, optional
-            Root seed for the run. When provided, the sampled inputs are
-            reproducible and identical across serial and parallel execution and
-            across any number of workers: each simulation index derives its own
-            decorrelated child stream from this root, so index ``i`` receives the
-            same inputs no matter which worker runs it. A supplied ``SeedSequence``
+            Root seed for the run. When provided, the mapping from simulation
+            index to sampled inputs is reproducible and identical across serial
+            and parallel execution and across any number of workers: each
+            simulation index derives its own decorrelated child stream from this
+            root, so index ``i`` receives the same inputs no matter which worker
+            runs it. The rows themselves are written in completion order, since
+            a worker takes the log lock once its simulation is done, so the file
+            order can differ between runs. Compare by the recorded index rather
+            than byte for byte. A supplied ``SeedSequence``
             is copied from its full state rather than consumed, so repeated calls
             with the same seed reproduce the same inputs. Each model is reseeded
             with a 128-bit integer -- the seed type a custom sampler's
@@ -237,6 +241,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         until the last iteration. You can then load the results and continue
         the simulation by running the ``simulate`` method again with the
         same number of simulations and setting `append=True`.
+
+        Not every interruption leaves a checkpoint that can be continued. The
+        two logs have to hold the same simulations as a complete run of indices
+        from zero, and a parallel run can stop with one worker's index missing
+        while a later one is already written. Such a checkpoint is refused
+        rather than repaired, which is #1075.
 
         Important
         ---------
