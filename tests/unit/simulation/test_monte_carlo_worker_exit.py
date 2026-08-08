@@ -9,7 +9,7 @@ is what separates those from a clean finish.
 
 import types
 from contextlib import contextmanager
-from time import monotonic
+from time import monotonic, sleep
 
 import pytest
 
@@ -292,3 +292,52 @@ def test_the_shutdown_window_is_not_cut_short_by_a_worker_already_known_dead():
     mc._wait_for_workers([crashed, blocked], timeout=0.3)
 
     assert blocked.joins > 1, "the grace period returned without waiting"
+
+
+class _Stubborn:
+    """A worker that sits through terminate and kill, recording its waits."""
+
+    def __init__(self, waits):
+        self.exitcode = None
+        self._waits = waits
+
+    def join(self, timeout=None, **_k):
+        self._waits.append(timeout)
+        if timeout:
+            sleep(timeout)
+
+    def is_alive(self):
+        return True
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+@pytest.mark.parametrize("fleet_size", [1, 6])
+def test_shutdown_is_bounded_by_the_grace_period_not_by_the_fleet_size(fleet_size):
+    """Each worker used to get the full grace to itself, so the wait scaled with
+    the fleet: six stubborn workers held the parent for six grace periods per
+    phase rather than one. The deadline is shared now, so a larger fleet costs
+    the same wall clock as a single worker.
+    """
+    grace = 0.2
+    waits = []
+    fleet = [_Stubborn(waits) for _ in range(fleet_size)]
+
+    mc._stop_any_worker_still_running(fleet, grace=grace)
+
+    assert len(waits) == 2 * fleet_size, "every worker is still waited on"
+    # What each worker was granted, rather than how long the call took, so a
+    # loaded machine cannot turn this into a flake. Per phase the total is one
+    # grace however many workers there are; it was one grace each.
+    for phase, granted in (
+        ("terminate", waits[:fleet_size]),
+        ("kill", waits[fleet_size:]),
+    ):
+        assert sum(granted) <= grace + 0.01, (
+            f"{phase}: {fleet_size} workers were granted {sum(granted):.2f}s "
+            f"against a {grace}s deadline"
+        )

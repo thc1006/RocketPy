@@ -2105,6 +2105,17 @@ def _wait_for_workers(started_processes, error_event=None, timeout=None):
         process.join(timeout=0)
 
 
+def _join_until(processes, deadline):
+    """Wait on the fleet against one clock rather than one clock each.
+
+    A full grace per worker made the wait scale with the fleet: eight stubborn
+    ones could hold the parent for eight times what the grace period promised,
+    and twice over, once for terminate and once for kill.
+    """
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - monotonic()))
+
+
 def _stop_any_worker_still_running(started_processes, grace=_WORKER_SHUTDOWN_GRACE):
     """Whatever is still going here is not going to stop on its own.
 
@@ -2115,16 +2126,14 @@ def _stop_any_worker_still_running(started_processes, grace=_WORKER_SHUTDOWN_GRA
     alive = [process for process in started_processes if process.is_alive()]
     for process in alive:
         process.terminate()
-    for process in alive:
-        process.join(timeout=grace)
+    _join_until(alive, monotonic() + grace)
 
     # terminate is a request. SIGKILL is not, and a worker that sat through the
     # first one would otherwise keep the manager and the files open for good.
     stubborn = [process for process in alive if process.is_alive()]
     for process in stubborn:
         process.kill()
-    for process in stubborn:
-        process.join(timeout=grace)
+    _join_until(stubborn, monotonic() + grace)
 
 
 def _fail_if_a_worker_did_not_finish(started_processes, error_event, error_file):
