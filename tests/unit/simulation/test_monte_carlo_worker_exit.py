@@ -420,3 +420,38 @@ def test_noticing_an_error_does_not_get_slower_with_a_bigger_fleet(fleet):
     elapsed = monotonic() - started
 
     assert elapsed < 0.5, f"{fleet} workers delayed the check by {elapsed:.2f}s"
+
+
+class _OriginalFailure(RuntimeError):
+    """What the caller should end up seeing."""
+
+
+class _CleanupFailure(RuntimeError):
+    """What must not take its place."""
+
+
+def test_the_final_cleanup_does_not_replace_the_failure_on_its_way_out(
+    parallel_runner, monkeypatch
+):
+    """The handler's own cleanup is best effort, but ``finally`` runs again on
+    the way out and was calling the same thing raw. A failure there landed on
+    the caller instead of the one being re-raised."""
+    monkeypatch.setattr(
+        mc, "_start_the_fleet", _raiser(_OriginalFailure, "cannot start")
+    )
+    monkeypatch.setattr(
+        mc,
+        "_stop_any_worker_still_running",
+        _raiser(_CleanupFailure, "cannot clean up"),
+    )
+
+    with pytest.warns(RuntimeWarning, match="final worker shutdown"):
+        with pytest.raises(_OriginalFailure, match="cannot start"):
+            mc.MonteCarlo._MonteCarlo__run_in_parallel(parallel_runner, n_workers=2)
+
+
+def _raiser(exception, message):
+    def raise_it(*_args, **_kwargs):
+        raise exception(message)
+
+    return raise_it

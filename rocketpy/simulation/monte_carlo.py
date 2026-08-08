@@ -628,7 +628,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 # Bare, so the handler's own line does not join the traceback.
                 raise
             finally:
-                _stop_any_worker_still_running(started_processes)
+                # Also best effort: this runs while an exception may be on its
+                # way out, and a cleanup that raises here would replace it.
+                _best_effort(
+                    lambda: _stop_any_worker_still_running(started_processes),
+                    "final worker shutdown",
+                )
 
     def __validate_number_of_workers(self, n_workers):
         # os.cpu_count() is documented as possibly None, and comparing against
@@ -2071,11 +2076,9 @@ def _record_failure(error_file, sim_idx, inputs_json, details):
         with open(error_file, "a", encoding="utf-8") as handle:
             handle.write(_build_error_record(sim_idx, inputs_json, details))
     except Exception as reporting_error:  # pylint: disable=broad-exception-caught
-        warnings.warn(
+        _say_so_without_raising(
             f"The simulation failed and its error record could not be written: "
-            f"{reporting_error!r}",
-            RuntimeWarning,
-            stacklevel=2,
+            f"{reporting_error!r}"
         )
 
 
@@ -2143,15 +2146,28 @@ def _write_unfinished_inputs(error_file, inputs_json):
         f.write(inputs_json)
 
 
+def _say_so_without_raising(message):
+    """Report a secondary failure in a way that cannot become the primary one.
+
+    ``warnings.warn`` raises when the caller has turned ``RuntimeWarning`` into
+    an error, which is exactly how a diagnostic ends up replacing the failure it
+    describes. The filter is overridden for this one warning only.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", RuntimeWarning)
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
 def _best_effort(action, description):
     """Run one shutdown step, reporting a failure rather than raising it."""
     try:
         action()
     except Exception as cleanup_error:  # pylint: disable=broad-exception-caught
-        warnings.warn(
-            f"Worker cleanup failed during {description}: {cleanup_error!r}",
-            RuntimeWarning,
-            stacklevel=2,
+        _say_so_without_raising(
+            f"Worker cleanup failed during {description}: {cleanup_error!r}"
         )
 
 

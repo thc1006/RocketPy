@@ -10,6 +10,7 @@ raised ``UnboundLocalError`` over the real error while holding the mutex, and
 
 import json
 import traceback
+import warnings
 import threading
 import types
 
@@ -427,3 +428,31 @@ def test_a_shutdown_failure_does_not_replace_the_error_it_is_handling(monkeypatc
 
     with pytest.warns(RuntimeWarning, match="graceful worker wait"):
         mc._bring_the_fleet_down([], _Event())
+
+
+def test_reporting_a_failure_cannot_escape_when_warnings_are_errors(
+    tmp_path, monkeypatch
+):
+    """The guard around the error write is only best effort under the default
+    filter. Turn RuntimeWarning into an error, as a strict application or test
+    run does, and the diagnostic becomes the exception it was describing."""
+    runner = _serial_runner(
+        tmp_path,
+        monkeypatch,
+        _OneThenStop(),
+        _MonteCarlo__evaluate_flight_outputs=_raise,
+    )
+    real_open = open
+
+    def refuse_the_error_file(path, *args, **kwargs):
+        if str(path) == str(runner.error_file):
+            raise OSError("error disk unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", refuse_the_error_file)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+
+        with pytest.raises(_Boom, match="injected"):
+            mc.MonteCarlo._MonteCarlo__run_in_serial(runner)
