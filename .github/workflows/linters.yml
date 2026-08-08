@@ -28,7 +28,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install .[all]
         pip install .[tests]
-        pip install pylint ruff
+        # Pinned, because both decide whether this job passes and both change
+        # what they report between releases. Unpinned, the formatter widening
+        # its scope or pylint adding a check turns a branch red with no commit
+        # to explain it. Bumping these is a deliberate change, made when the
+        # tree is ready for what the new version says.
+        pip install "pylint==4.0.6" "ruff==0.16.2"
     - name: Ruff (lint)
       run: ruff check --output-format=github .
     - name: Ruff (format)
