@@ -35,10 +35,10 @@ import pytest
 
 from rocketpy.simulation import MonteCarlo
 from rocketpy.simulation.monte_carlo import (
-    _SimMonitor,
-    _validate_simulation_count,
     _claim_next_index,
     _seed_sequence_to_int,
+    _SimMonitor,
+    _validate_simulation_count,
 )
 
 _root_seed_sequence = MonteCarlo._MonteCarlo__root_seed_sequence
@@ -345,3 +345,21 @@ def test_a_count_that_is_not_a_whole_number_is_still_refused(count):
     an ``int`` to ``isinstance`` and would quietly run one simulation."""
     with pytest.raises(TypeError):
         _validate_simulation_count(count)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["sequence", "SeedSequence"])
+def test_mutating_the_caller_s_entropy_does_not_move_the_captured_root(wrapped):
+    """`SeedSequence` keeps a sequence entropy by reference, and so did the
+    capture, so a caller who reused and edited their list changed the children
+    of a run that had already read it. An int seed was never exposed to this.
+    """
+    entropy = [1, 2, 3]
+    seed = np.random.SeedSequence(entropy) if wrapped else entropy
+
+    runner = MonteCarlo.__new__(MonteCarlo)
+    MonteCarlo._MonteCarlo__capture_root_state(runner, seed)
+    before = _entropy(_child_seed(runner, 7))
+
+    entropy[0] = 999999
+
+    assert _entropy(_child_seed(runner, 7)) == before

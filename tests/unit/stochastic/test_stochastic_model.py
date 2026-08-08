@@ -1,12 +1,10 @@
 from types import SimpleNamespace
 
 import numpy as np
-
 import pytest
 
-from rocketpy.stochastic import StochasticFreeFormFins
 from rocketpy import Environment
-from rocketpy.stochastic import StochasticEnvironment
+from rocketpy.stochastic import StochasticEnvironment, StochasticFreeFormFins
 from rocketpy.stochastic.stochastic_model import StochasticModel
 
 

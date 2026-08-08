@@ -18,6 +18,7 @@ import json
 import os
 import traceback
 import warnings
+from copy import deepcopy
 from numbers import Real
 from pathlib import Path
 from time import monotonic, time
@@ -358,11 +359,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         per-index child seeds from it (see ``__child_seed``), instead of
         materializing and pickling the full ``spawn(number_of_simulations)``
         list to each process.
+
+        Deep-copied, because ``SeedSequence`` keeps a sequence entropy by
+        reference. Without it a caller who mutates the list they passed changes
+        the children this run derives, which is the opposite of a snapshot.
         """
         root = self.__root_seed_sequence(random_seed)
         self.__root_state = (
-            root.entropy,
-            root.spawn_key,
+            deepcopy(root.entropy),
+            tuple(root.spawn_key),
             root.pool_size,
             root.n_children_spawned,
         )
