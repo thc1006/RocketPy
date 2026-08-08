@@ -1988,7 +1988,10 @@ def _refuse_a_checkpoint_that_does_not_line_up(label, path, written, resume_at):
             f"cannot append to {path}: the {label} are numbered from 1, which "
             f"is how versions before per-index seeding wrote serial runs. This "
             f"release numbers from 0, so the two cannot be continued into each "
-            f"other. Re-run the study, or renumber the file down by one."
+            f"other. Re-run the study. Renumbering the rows would line the "
+            f"indices up without lining the seeds up: those rows came from the "
+            f"old sequential scheme, not from the per-index derivation this "
+            f"release would use for the same indices."
         )
     if indices != set(range(resume_at)):
         missing = sorted(set(range(resume_at)) - indices)

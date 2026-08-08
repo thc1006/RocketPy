@@ -462,5 +462,11 @@ def test_a_checkpoint_numbered_from_one_is_named_as_such(tmp_path):
     inputs.write_text(rows)
     outputs.write_text(rows)
 
-    with pytest.raises(ValueError, match="numbered from 1"):
+    with pytest.raises(ValueError, match="numbered from 1") as raised:
         mc._check_the_checkpoint_supports_appending(inputs, outputs, 3)
+
+    # The message used to offer renumbering as an alternative to re-running,
+    # which lines the indices up and leaves the seeds behind: those rows came
+    # from the old sequential scheme, not from this release's per-index one.
+    assert "Renumbering" in str(raised.value)
+    assert "without lining the seeds up" in str(raised.value)
