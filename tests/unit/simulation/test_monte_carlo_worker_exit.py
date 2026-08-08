@@ -287,12 +287,20 @@ def test_the_parent_stops_waiting_when_a_worker_dies_holding_the_lock():
 
 def test_the_shutdown_window_is_not_cut_short_by_a_worker_already_known_dead():
     """The grace period exists so the survivors can finish their writes. It is
-    bounded by its own timeout, so a crash must not end it early."""
+    bounded by its own timeout, so a crash must not end it early.
+
+    On elapsed time rather than on how many times a worker was joined: that
+    counted the old per-worker blocking join, which is the mechanism and not the
+    behaviour. The wait can only overshoot the deadline, never undershoot it, so
+    a floor well under the timeout is safe on a coarse clock.
+    """
     crashed, blocked = _Crashed(), _BlockedForever(give_up_after=10**6)
 
+    started = monotonic()
     mc._wait_for_workers([crashed, blocked], timeout=0.3)
+    elapsed = monotonic() - started
 
-    assert blocked.joins > 1, "the grace period returned without waiting"
+    assert elapsed >= 0.2, f"the grace period returned after {elapsed:.3f}s"
 
 
 class _Stubborn:
@@ -371,3 +379,44 @@ def test_the_parent_does_not_repeat_its_own_frame_in_the_traceback(
     frames = [frame.name for frame in traceback.extract_tb(raised.value.__traceback__)]
     assert "start_then_fail" in frames, frames
     assert frames.count("__run_in_parallel") == 1, frames
+
+
+class _NeverFinishes:
+    """Alive throughout, and costly to join, as a real blocked worker is."""
+
+    def __init__(self):
+        self.exitcode = None
+
+    def join(self, timeout=None, **_k):
+        if timeout:
+            sleep(timeout)
+
+    def is_alive(self):
+        return True
+
+
+class _SetMidRound:
+    """Not set when a round begins, set while the parent is inside it."""
+
+    def __init__(self):
+        self.checks = 0
+
+    def is_set(self):
+        self.checks += 1
+        return self.checks > 1
+
+
+@pytest.mark.parametrize("fleet", [1, 24], ids=["one", "twenty_four"])
+def test_noticing_an_error_does_not_get_slower_with_a_bigger_fleet(fleet):
+    """Joining every worker for 0.1s before rechecking the event made the delay
+    the fleet size times that: 24 workers took 2.4s to notice. One sleep per
+    round instead, so the cost is the round and not the fleet.
+
+    Both sizes are measured against the same ceiling rather than against each
+    other, because the point is that neither depends on the count.
+    """
+    started = monotonic()
+    mc._wait_for_workers([_NeverFinishes() for _ in range(fleet)], _SetMidRound())
+    elapsed = monotonic() - started
+
+    assert elapsed < 0.5, f"{fleet} workers delayed the check by {elapsed:.2f}s"

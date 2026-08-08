@@ -21,7 +21,7 @@ import warnings
 from copy import deepcopy
 from numbers import Real
 from pathlib import Path
-from time import monotonic, time
+from time import monotonic, sleep, time
 
 import numpy as np
 import simplekml
@@ -2043,6 +2043,9 @@ def _validate_simulation_count(number_of_simulations):
 
 
 _WORKER_SHUTDOWN_GRACE = 5.0
+# One sleep per round, not per worker, so the fleet size does not set how soon
+# an error is noticed.
+_WORKER_POLL_INTERVAL = 0.05
 
 
 def _record_simulation(input_file, output_file, inputs_json, outputs_json):
@@ -2176,6 +2179,11 @@ def _wait_for_workers(started_processes, error_event=None, timeout=None):
 
     No overall deadline on the normal path: a run with no error and one worker
     still going is a long simulation, and that is not for this to cut short.
+
+    The wait itself is one sleep per round rather than a blocking join on each
+    worker in turn, so how soon the event is noticed does not grow with the
+    fleet. Blocking 0.1 s per worker meant 100 of them delayed the next check by
+    10 s.
     """
     deadline = None if timeout is None else monotonic() + timeout
     while any(process.is_alive() for process in started_processes):
@@ -2186,10 +2194,13 @@ def _wait_for_workers(started_processes, error_event=None, timeout=None):
         # has nothing else to end it.
         if deadline is None and _workers_that_crashed(started_processes):
             break
-        if deadline is not None and monotonic() >= deadline:
+        if deadline is None:
+            sleep(_WORKER_POLL_INTERVAL)
+            continue
+        remaining = deadline - monotonic()
+        if remaining <= 0:
             break
-        for process in started_processes:
-            process.join(timeout=0.1)
+        sleep(min(_WORKER_POLL_INTERVAL, remaining))
 
     # Reap whatever has already finished. A worker that was gone before the
     # loop started was never joined by it, and an unjoined child has no exit
