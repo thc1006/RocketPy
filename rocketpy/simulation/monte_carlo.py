@@ -73,6 +73,24 @@ def _create_empty_logs_atomically(paths):
         os.replace(temporary, destination)
 
 
+def _seed_root_fingerprint(root):
+    """A comparable identity for a seed root, when the root itself is not one.
+
+    ``entropy`` may be an ndarray, and comparing two of those answers with an
+    array rather than a verdict, so a tuple holding one raises instead of
+    deciding. ``[1, 2, 3]`` and ``(1, 2, 3)`` are the same seed and compare
+    unequal. The generated words settle both. ``n_children_spawned`` stays,
+    because ``__child_seed`` counts from it and two roots that differ only there
+    hand out different children.
+    """
+    return (
+        tuple(int(word) for word in root.generate_state(4, dtype=np.uint32)),
+        tuple(int(key) for key in root.spawn_key),
+        int(root.pool_size),
+        int(root.n_children_spawned),
+    )
+
+
 def _warn_when_appending_leaves_the_lineage(previous, previous_chosen, current):
     """Say so when appended rows stop sharing the seed lineage below them.
 
@@ -150,7 +168,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
     # No run yet, so nothing to continue. Class-level so an instance built
     # without __init__ still answers.
     __root_state = None
+    __root_fingerprint = None
     __root_seed_given = False
+    # What the logs on disk actually hold, which only moves once a run has
+    # put rows from its own root into them.
+    __committed_fingerprint = None
+    __committed_seed_given = False
 
     def __init__(
         self,
@@ -357,19 +380,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
         if append:
-            _check_the_checkpoint_supports_appending(
-                self.input_file, self.output_file, self._initial_sim_idx
-            )
-            # ``number_of_simulations`` is the target to reach, not a batch to
-            # add. Below the checkpoint it ran nothing, reported success, and
-            # left a file with more simulations than the caller had asked for.
-            if number_of_simulations < self._initial_sim_idx:
-                raise ValueError(
-                    f"number_of_simulations is the total to reach when "
-                    f"append=True. The checkpoint already holds "
-                    f"{self._initial_sim_idx} simulations, more than the "
-                    f"requested {number_of_simulations}."
-                )
+            self.__check_this_append_can_continue(number_of_simulations)
         # Both run paths catch Ctrl-C, save what they have and return, so a
         # stopped run is incomplete on purpose and the completeness check below
         # has to know the difference between that and a worker going missing.
@@ -385,12 +396,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         print("Starting Monte Carlo analysis")
 
         self.__setup_files(append)
+        if not append:
+            # Emptied just now, so whatever they held is gone and this root
+            # owns them even if the run below never reaches its first row.
+            self.__commit_root_lineage()
 
         if parallel:
             self.__run_in_parallel(n_workers)
         else:
             self.__run_in_serial()
 
+        if number_of_simulations > self._initial_sim_idx:
+            self.__commit_root_lineage()
         self.__check_each_index_was_recorded_once()
         self.__terminate_simulation()
 
@@ -470,7 +487,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         reference. Without it a caller who mutates the list they passed changes
         the children this run derives, which is the opposite of a snapshot.
         """
-        previous, previous_chosen = self.__root_state, self.__root_seed_given
         root = self.__root_seed_sequence(random_seed)
         self.__root_state = (
             deepcopy(root.entropy),
@@ -478,13 +494,57 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             root.pool_size,
             root.n_children_spawned,
         )
+        # The state above rebuilds children and cannot be compared; the
+        # fingerprint compares and cannot rebuild. Both, rather than one.
+        self.__root_fingerprint = _seed_root_fingerprint(root)
         # Whether a caller chose this root or it came from fresh entropy. Only a
         # chosen one is a lineage there is any point in continuing.
         self.__root_seed_given = random_seed is not None
         if appending:
-            _warn_when_appending_leaves_the_lineage(
-                previous, previous_chosen, self.__root_state
+            # The manifest first: it outlives this object, which the attributes
+            # below do not, and it describes the rows actually in the log.
+            recorded = _fingerprint_from_manifest(self.output_file)
+            previous, previous_chosen = recorded or (
+                self.__committed_fingerprint,
+                self.__committed_seed_given,
             )
+            _warn_when_appending_leaves_the_lineage(
+                previous, previous_chosen, self.__root_fingerprint
+            )
+
+    def __check_this_append_can_continue(self, number_of_simulations):
+        """Everything an append has to satisfy before a file is opened.
+
+        Held here rather than after the run so a checkpoint that cannot be
+        continued costs no simulations and is left exactly as it was found.
+        """
+        _check_the_checkpoint_supports_appending(
+            self.input_file, self.output_file, self._initial_sim_idx
+        )
+        # ``number_of_simulations`` is the target to reach, not a batch to add.
+        # Below the checkpoint it ran nothing, reported success, and left a file
+        # with more simulations than the caller had asked for.
+        if number_of_simulations < self._initial_sim_idx:
+            raise ValueError(
+                f"number_of_simulations is the total to reach when "
+                f"append=True. The checkpoint already holds "
+                f"{self._initial_sim_idx} simulations, more than the "
+                f"requested {number_of_simulations}."
+            )
+
+    def __commit_root_lineage(self):
+        """Record that the logs now hold rows derived from this run's root.
+
+        Kept apart from capturing it, because the capture runs before anything
+        opens a file. A run that warns and then adds nothing, or that dies before
+        its first row, must leave the logs owned by the root already in them, or
+        the append after it compares against a lineage that was never written.
+        Object-local, so a rebuilt ``MonteCarlo`` starts blank; carrying it in
+        the files is #1075.
+        """
+        self.__committed_fingerprint = self.__root_fingerprint
+        self.__committed_seed_given = self.__root_seed_given
+        _write_run_manifest(self.output_file, self.__root_state, self.__root_seed_given)
 
     def __child_seed(self, sim_idx):
         """Return the seed sequence for a single simulation index.
@@ -2070,6 +2130,133 @@ def _recorded_indices(label, path):
     return written, damaged
 
 
+# Written beside the output log so a later run can tell which scheme produced
+# the rows. Index shape cannot: the previous release numbered parallel runs from
+# 0 as well, and those rows came from per-worker entropy, shared component seeds
+# and a different sampling call sequence.
+_MANIFEST_SCHEMA_VERSION = 1
+_SAMPLING_SCHEME = "per-index-seed-v1"
+
+
+def _manifest_path(output_file):
+    """Where the manifest for a given output log lives."""
+    return Path(output_file).with_suffix(".manifest.json")
+
+
+def _jsonable_entropy(entropy):
+    """``SeedSequence`` entropy as something ``json`` will take.
+
+    It may be an int, a sequence of ints or an ndarray, and only the first of
+    those survives ``json.dumps`` unhelped.
+    """
+    if isinstance(entropy, (int, np.integer)):
+        return int(entropy)
+    if entropy is None:
+        return None
+    return [int(part) for part in np.asarray(entropy).ravel()]
+
+
+def _write_run_manifest(output_file, root_state, seed_chosen):
+    """Record the scheme and the root the rows in this log came from.
+
+    Best effort on the way out: a manifest that cannot be written is worth a
+    warning, not the loss of a finished run. The next append refuses without it,
+    which is the safe direction.
+    """
+    entropy, spawn_key, pool_size, base = root_state
+    document = {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "sampling_scheme": _SAMPLING_SCHEME,
+        "log_format": "jsonl-v1",
+        "seed_chosen": bool(seed_chosen),
+        "root_state": {
+            "entropy": _jsonable_entropy(entropy),
+            "spawn_key": [int(key) for key in spawn_key],
+            "pool_size": int(pool_size),
+            "n_children_spawned": int(base),
+        },
+    }
+    _best_effort(
+        lambda: _manifest_path(output_file).write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        ),
+        "run manifest",
+    )
+
+
+def _read_run_manifest(output_file):
+    """The manifest beside a log, or ``None`` when there is not a usable one."""
+    path = _manifest_path(output_file)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _fingerprint_from_manifest(output_file):
+    """``(fingerprint, whether the seed was chosen)`` for the log's own root.
+
+    The object that wrote the rows is usually gone by the time an append runs,
+    so this is what makes the lineage check survive a fresh interpreter.
+    ``None`` when there is no manifest or it does not describe a root.
+    """
+    manifest = _read_run_manifest(output_file)
+    if manifest is None:
+        return None
+    recorded = manifest.get("root_state")
+    if not isinstance(recorded, dict):
+        return None
+    try:
+        # Rebuilt for its words only. n_children_spawned is read-only on a
+        # SeedSequence, so it is carried across as the recorded number instead.
+        root = np.random.SeedSequence(
+            entropy=recorded["entropy"],
+            spawn_key=tuple(recorded["spawn_key"]),
+            pool_size=recorded["pool_size"],
+        )
+        fingerprint = (
+            tuple(int(word) for word in root.generate_state(4, dtype=np.uint32)),
+            tuple(int(key) for key in recorded["spawn_key"]),
+            int(recorded["pool_size"]),
+            int(recorded["n_children_spawned"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return fingerprint, bool(manifest.get("seed_chosen", False))
+
+
+def _refuse_a_checkpoint_from_another_scheme(output_file, resume_at):
+    """Refuse rows this release cannot have written, however they are numbered.
+
+    The previous release numbered parallel runs from 0 too, so a clean one of
+    those passes every check on index shape while its rows came from per-worker
+    entropy and a different sampling order. Only something written alongside
+    them can tell, so a checkpoint with nothing in it is refused rather than
+    guessed at.
+    """
+    if resume_at <= 0:
+        return
+    manifest = _read_run_manifest(output_file)
+    if manifest is None:
+        raise ValueError(
+            f"cannot append to {output_file}: no {_manifest_path(output_file).name} "
+            f"beside it, so the rows cannot be shown to come from this release. "
+            f"Runs before per-index seeding numbered parallel results from 0 as "
+            f"well, and appending to one would put two sampling schemes in one "
+            f"file. Re-run the study to start a checkpoint this release owns."
+        )
+    scheme = manifest.get("sampling_scheme")
+    version = manifest.get("schema_version")
+    if scheme != _SAMPLING_SCHEME or version != _MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"cannot append to {output_file}: it was written by sampling scheme "
+            f"{scheme!r} at schema version {version!r}, and this release writes "
+            f"{_SAMPLING_SCHEME!r} at {_MANIFEST_SCHEMA_VERSION}. Re-run the "
+            f"study rather than continuing one scheme with another."
+        )
+
+
 def _check_the_checkpoint_supports_appending(input_file, output_file, resume_at):
     """Everything that can be judged from the files, before a worker starts.
 
@@ -2096,6 +2283,8 @@ def _check_the_checkpoint_supports_appending(input_file, output_file, resume_at)
                 f"{damaged[:3]}."
             )
         _refuse_a_checkpoint_that_does_not_line_up(label, path, written, resume_at)
+
+    _refuse_a_checkpoint_from_another_scheme(output_file, resume_at)
 
     inputs, _ = _recorded_indices("inputs", input_file)
     outputs, _ = _recorded_indices("outputs", output_file)

@@ -34,9 +34,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import rocketpy.simulation.monte_carlo as mc_module
 from rocketpy.simulation import MonteCarlo
 from rocketpy.simulation.monte_carlo import (
     _claim_next_index,
+    _seed_root_fingerprint,
     _seed_sequence_to_int,
     _SimMonitor,
     _validate_simulation_count,
@@ -367,6 +369,9 @@ def test_mutating_the_caller_s_entropy_does_not_move_the_captured_root(wrapped):
     assert _entropy(_child_seed(runner, 7)) == before
 
 
+SEED_ARRAY = np.array([1, 2, 3], dtype=np.uint32)
+
+
 @pytest.mark.parametrize(
     "first_seed, second_seed, expect_warning",
     [
@@ -374,10 +379,19 @@ def test_mutating_the_caller_s_entropy_does_not_move_the_captured_root(wrapped):
         (42, 7, True),  # a different chosen root is the same mixing
         (42, 42, False),  # continuing the same run
         (None, None, False),  # nothing was being preserved
+        # numpy.random.SeedSequence takes array_like[ints], so an ndarray is a
+        # seed this accepts. Comparing two of those elementwise answers with an
+        # array, which is not a verdict, and used to raise here.
+        (SEED_ARRAY, SEED_ARRAY, False),
+        (SEED_ARRAY, np.array([1, 2, 3], dtype=np.uint32), False),
+        (SEED_ARRAY, np.array([9, 9, 9], dtype=np.uint32), True),
+        # Same seed, different container: one lineage, so no warning.
+        ([1, 2, 3], (1, 2, 3), False),
+        (np.random.SeedSequence(7), 7, False),
     ],
 )
 def test_appending_says_so_when_it_leaves_the_seed_lineage(
-    first_seed, second_seed, expect_warning
+    first_seed, second_seed, expect_warning, tmp_path
 ):
     """Mixing two lineages in one file is invisible to every structural check.
 
@@ -385,21 +399,42 @@ def test_appending_says_so_when_it_leaves_the_seed_lineage(
     two files stay in step, so only the roots themselves can tell (#1075).
     """
     analysis = object.__new__(MonteCarlo)
+    # Committing writes the manifest beside this, and the append below reads it.
+    analysis._output_file = str(tmp_path / "run.outputs.txt")
     analysis._MonteCarlo__capture_root_state(first_seed)
-    previous_root = analysis._MonteCarlo__root_state
-    previous_chosen = analysis._MonteCarlo__root_seed_given
-    analysis._MonteCarlo__capture_root_state(second_seed)
+    # What simulate does once the first run has put rows in the logs.
+    analysis._MonteCarlo__commit_root_lineage()
 
     with warnings.catch_warnings(record=True) as raised:
         warnings.simplefilter("always")
-        _warn_when_appending_leaves_the_lineage(
-            previous_root, previous_chosen, analysis._MonteCarlo__root_state
-        )
+        analysis._MonteCarlo__capture_root_state(second_seed, appending=True)
 
     lineage_warnings = [w for w in raised if "seed lineage" in str(w.message)]
     assert bool(lineage_warnings) is expect_warning
     if expect_warning:
         assert issubclass(lineage_warnings[0].category, RuntimeWarning)
+
+
+def test_a_root_that_derives_the_same_children_fingerprints_the_same():
+    """The fingerprint has to answer the question the roots cannot.
+
+    It stands in for the root in the lineage check, so two roots handing out the
+    same children must agree and two handing out different ones must not.
+    """
+    same = [
+        _seed_root_fingerprint(np.random.SeedSequence([1, 2, 3])),
+        _seed_root_fingerprint(np.random.SeedSequence((1, 2, 3))),
+        _seed_root_fingerprint(np.random.SeedSequence(SEED_ARRAY)),
+    ]
+    assert same[0] == same[1] == same[2]
+    assert all(isinstance(part, (tuple, int)) for part in same[0])
+
+    spawned = np.random.SeedSequence(42)
+    before = _seed_root_fingerprint(spawned)
+    spawned.spawn(3)  # children counted from here on, so the identity moves
+
+    assert _seed_root_fingerprint(spawned) != before
+    assert _seed_root_fingerprint(np.random.SeedSequence(43)) != before
 
 
 def test_a_fresh_object_has_no_lineage_to_leave():
@@ -473,3 +508,67 @@ def test_the_flight_flies_the_inputs_that_get_logged(monkeypatch):
     assert flight.inclination == logged["inclination"]
     assert flight.heading == logged["heading"]
     assert logged == drawn[0], "one draw, so the row logged is the first one"
+
+
+def _simulate_without_flying(monkeypatch, analysis):
+    """Drive ``simulate`` for its control flow, with the run itself removed.
+
+    The defect being covered is an ordering one, so the ordering has to be the
+    real method rather than a retelling of it in the test.
+    """
+    analysis.data_collector = None
+    analysis.num_of_loaded_sims = 0
+    # The public setters read the file they are pointed at; the run itself is
+    # stubbed out here, so the private attributes are what the getters need.
+    analysis._input_file = "run.inputs.txt"
+    analysis._output_file = "run.outputs.txt"
+    analysis._error_file = "run.errors.txt"
+    for name in (
+        "_MonteCarlo__setup_files",
+        "_MonteCarlo__run_in_serial",
+        "_MonteCarlo__check_each_index_was_recorded_once",
+        "_MonteCarlo__terminate_simulation",
+    ):
+        monkeypatch.setattr(MonteCarlo, name, lambda *a, **k: None)
+    monkeypatch.setattr(
+        mc_module, "_check_the_checkpoint_supports_appending", lambda *a, **k: None
+    )
+
+    def run(total, seed, append):
+        with warnings.catch_warnings(record=True) as raised:
+            warnings.simplefilter("always")
+            analysis.simulate(total, append=append, random_seed=seed)
+        analysis.num_of_loaded_sims = total
+        return bool([w for w in raised if "seed lineage" in str(w.message)])
+
+    return run
+
+
+def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch):
+    """The warning has to survive an append that wrote no rows.
+
+    ``simulate`` captures the root before it touches a file, so the object used
+    to believe the new lineage had landed even when the run added nothing. The
+    append after that one silently put rows from the second root behind rows
+    from the first, which is exactly the case the warning exists for (#1075).
+    """
+    run = _simulate_without_flying(monkeypatch, object.__new__(MonteCarlo))
+
+    assert run(2, 42, False) is False  # first run, nothing to leave
+    assert run(2, 7, True) is True  # warns, and adds no rows
+    assert run(4, 7, True) is True  # the one that actually appends seed 7
+    assert run(6, 7, True) is False  # now genuinely the same lineage
+
+
+def test_a_refused_append_leaves_the_lineage_where_it_was(monkeypatch):
+    """A warning promoted to an error must not still move the tracker."""
+    analysis = object.__new__(MonteCarlo)
+    run = _simulate_without_flying(monkeypatch, analysis)
+    run(2, 42, False)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning):
+            analysis.simulate(4, append=True, random_seed=7)
+
+    assert run(4, 7, True) is True, "the files still hold the first lineage"

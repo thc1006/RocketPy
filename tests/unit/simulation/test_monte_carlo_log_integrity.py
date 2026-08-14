@@ -14,6 +14,7 @@ import json
 import tempfile
 import threading
 import types
+import warnings
 
 import pytest
 
@@ -648,3 +649,79 @@ def test_nothing_in_flight_writes_no_row_at_all():
     """An interrupt between two simulations has nothing to mark."""
     assert mc._build_unfinished_record("", "interrupted") == ""
     assert mc._build_unfinished_record(None, "cancelled") == ""
+
+
+def _old_parallel_checkpoint(tmp_path, rows=2):
+    """Logs shaped exactly like a clean run from before per-index seeding.
+
+    The previous release numbered parallel runs from 0 as well, so these pass
+    every check that reads only the indices.
+    """
+    body = "".join(json.dumps({"index": i}) + "\n" for i in range(rows))
+    inputs, outputs = tmp_path / "run.inputs.txt", tmp_path / "run.outputs.txt"
+    inputs.write_text(body, encoding="utf-8")
+    outputs.write_text(body, encoding="utf-8")
+    return inputs, outputs
+
+
+def test_a_checkpoint_from_the_old_parallel_scheme_is_refused(tmp_path):
+    """Index shape cannot tell the two schemes apart, so something else must.
+
+    A clean 0..N-1 log from the previous release passes every structural check
+    while its rows came from per-worker entropy, shared component seeds and a
+    different sampling call sequence.
+    """
+    inputs, outputs = _old_parallel_checkpoint(tmp_path)
+
+    with pytest.raises(ValueError, match="manifest"):
+        mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
+
+
+def test_a_checkpoint_this_release_wrote_is_accepted(tmp_path):
+    """The same rows, with the manifest beside them, continue normally."""
+    inputs, outputs = _old_parallel_checkpoint(tmp_path)
+    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+
+    mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
+
+
+def test_a_manifest_from_another_scheme_is_refused(tmp_path):
+    """A future or foreign scheme is named rather than guessed at."""
+    inputs, outputs = _old_parallel_checkpoint(tmp_path)
+    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+    path = mc._manifest_path(str(outputs))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["sampling_scheme"] = "something-else-v9"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="something-else-v9"):
+        mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
+
+
+def test_an_empty_checkpoint_needs_no_manifest(tmp_path):
+    """A first run has nothing to be continued from, so nothing to prove."""
+    inputs, outputs = _old_parallel_checkpoint(tmp_path, rows=0)
+
+    mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 0)
+
+
+def test_the_lineage_outlives_the_object_that_wrote_it(tmp_path):
+    """A fresh MonteCarlo has no memory, so the manifest has to carry it.
+
+    Rebuilding the object between two runs used to lose the root entirely, and
+    the append after it could not tell it was leaving the lineage.
+    """
+    output = str(tmp_path / "run.outputs.txt")
+
+    first = object.__new__(MonteCarlo)
+    first._output_file = output
+    first._MonteCarlo__capture_root_state(42)
+    first._MonteCarlo__commit_root_lineage()
+
+    second = object.__new__(MonteCarlo)  # nothing carried over in memory
+    second._output_file = output
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        second._MonteCarlo__capture_root_state(7, appending=True)
+
+    assert [w for w in raised if "seed lineage" in str(w.message)]
