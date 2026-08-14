@@ -17,6 +17,7 @@ import threading
 import types
 import warnings
 
+import numpy as np
 import pytest
 
 import rocketpy.simulation.monte_carlo as mc
@@ -289,6 +290,11 @@ class _Monitor:
 
 def _sim_worker(tmp_path, **overrides):
     attributes = {
+        # The failure path recovers what was drawn from these.
+        "_export_config": {},
+        "environment": types.SimpleNamespace(last_rnd_dict={}),
+        "rocket": types.SimpleNamespace(last_rnd_dict={}),
+        "flight": types.SimpleNamespace(last_rnd_dict={}),
         "error_file": tmp_path / "errors.txt",
         "input_file": tmp_path / "inputs.txt",
         "output_file": tmp_path / "outputs.txt",
@@ -363,6 +369,10 @@ def _serial_runner(tmp_path, row=""):
         _MonteCarlo__child_seed=lambda index: index,
         _MonteCarlo__seed_simulation=lambda seed: None,
         _MonteCarlo__run_single_simulation=object,
+        _export_config={},
+        environment=types.SimpleNamespace(last_rnd_dict={}),
+        rocket=types.SimpleNamespace(last_rnd_dict={}),
+        flight=types.SimpleNamespace(last_rnd_dict={}),
         _MonteCarlo__evaluate_flight_inputs=lambda index: row,
         _MonteCarlo__evaluate_flight_outputs=lambda flight, index: row,
     )
@@ -800,3 +810,52 @@ def test_the_logs_keep_the_mode_they_had(tmp_path):
     assert [path.read_bytes() for path in logs] == [b"", b"", b""]
     assert [path.stat().st_mode & 0o777 for path in logs] == [0o644] * 3
     assert not [x for x in tmp_path.iterdir() if x.suffix in (".partial", ".kept")]
+
+
+def _models_that_have_drawn():
+    """Three stochastic models carrying the values of a finished simulation."""
+    return [
+        types.SimpleNamespace(
+            last_rnd_dict={f"{name}_value": 1.0}, _set_stochastic=lambda seed: None
+        )
+        for name in ("environment", "rocket", "flight")
+    ]
+
+
+def test_reseeding_forgets_what_the_simulation_before_it_drew():
+    """A worker keeps its models, so the next index inherits the last one's row.
+
+    Without this, a simulation that failed before drawing anything reported the
+    values of the one before it as the inputs that caused the failure.
+    """
+    analysis = object.__new__(MonteCarlo)
+    analysis.environment, analysis.rocket, analysis.flight = _models_that_have_drawn()
+
+    analysis._MonteCarlo__seed_simulation(np.random.SeedSequence(42))
+
+    assert [
+        model.last_rnd_dict
+        for model in (analysis.environment, analysis.rocket, analysis.flight)
+    ] == [{}, {}, {}]
+
+
+def test_recording_a_pair_forgets_what_produced_it(tmp_path):
+    """Once the row is on disk it is not in flight, so it cannot be recovered.
+
+    ``_inputs_drawn_so_far`` reads the same dicts, and a failure later in the
+    loop would otherwise attach a simulation that had already succeeded to it.
+    """
+    inputs, outputs = tmp_path / "inputs.txt", tmp_path / "outputs.txt"
+    models = _models_that_have_drawn()
+
+    mc._record_simulation(inputs, outputs, '{"index": 0}\n', '{"index": 0}\n', models)
+
+    assert [model.last_rnd_dict for model in models] == [{}, {}, {}]
+    assert inputs.read_text() == '{"index": 0}\n'
+
+
+def test_nothing_drawn_recovers_nothing():
+    """The recovery is a best effort, not a source of empty rows."""
+    empty = [types.SimpleNamespace(last_rnd_dict={}) for _ in range(3)]
+
+    assert mc._inputs_drawn_so_far(empty, 3, {}) == ""

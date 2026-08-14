@@ -57,6 +57,12 @@ def _worker(tmp_path, **overrides):
         "error_file": tmp_path / "errors.txt",
         "input_file": tmp_path / "inputs.txt",
         "output_file": tmp_path / "outputs.txt",
+        # The failure path recovers whatever was drawn from these, so the
+        # stand-in has to carry them the way a MonteCarlo does.
+        "_export_config": {},
+        "environment": types.SimpleNamespace(last_rnd_dict={}),
+        "rocket": types.SimpleNamespace(last_rnd_dict={}),
+        "flight": types.SimpleNamespace(last_rnd_dict={}),
         "_MonteCarlo__child_seed": lambda index: index,
         "_MonteCarlo__seed_simulation": lambda seed: None,
         "_MonteCarlo__run_single_simulation": object,
@@ -376,6 +382,10 @@ def test_a_worker_progress_failure_does_not_repeat_committed_inputs(tmp_path):
     the error file and one simulation appeared in the logs and the failures."""
     worker = _worker(
         tmp_path,
+        _export_config={},
+        environment=types.SimpleNamespace(last_rnd_dict={}),
+        rocket=types.SimpleNamespace(last_rnd_dict={}),
+        flight=types.SimpleNamespace(last_rnd_dict={}),
         _MonteCarlo__evaluate_flight_inputs=lambda index: '{"index": 0, "drew": 42}\n',
         _MonteCarlo__evaluate_flight_outputs=lambda flight, index: '{"index": 0}\n',
     )
@@ -516,3 +526,68 @@ def test_a_release_that_fails_on_its_own_is_still_raised():
 
     with pytest.raises(BrokenPipeError):
         mc._claim_next_index(_Fine(), _MutexDiesAfter(healthy_releases=0))
+
+
+@pytest.mark.parametrize(
+    "stopped_at, drawn",
+    [
+        ("environment", ({"wind": 1.0}, {}, {})),
+        ("rocket", ({"wind": 1.0}, {"mass": 2.0}, {})),
+        ("flight sampling", ({"wind": 1.0}, {"mass": 2.0}, {})),
+        ("Flight.__init__", ({"wind": 1.0}, {"mass": 2.0}, {"inclination": 84.0})),
+    ],
+)
+def test_an_error_row_keeps_whatever_was_drawn_before_the_failure(
+    tmp_path, monkeypatch, stopped_at, drawn
+):
+    """A failure before the row is built must not cost the inputs as well.
+
+    The whole row is only assembled once the flight is, so anything that raised
+    inside ``create_object`` or ``Flight`` itself used to leave a traceback with
+    nothing to say which inputs produced it (#1109 is one way in). Each model
+    fills its own ``last_rnd_dict`` as it goes, so the draws that did happen are
+    recoverable.
+    """
+    monkeypatch.setattr(mc, "_claim_next_index", lambda *a, **k: 0)
+    environment, rocket, flight = drawn
+    worker = _worker(
+        tmp_path,
+        environment=types.SimpleNamespace(last_rnd_dict=environment),
+        rocket=types.SimpleNamespace(last_rnd_dict=rocket),
+        flight=types.SimpleNamespace(last_rnd_dict=flight),
+        _MonteCarlo__run_single_simulation=_raise,
+    )
+
+    with pytest.raises(_Boom):
+        mc.MonteCarlo._MonteCarlo__sim_producer(
+            worker, object(), _RecordingMutex(), _Event()
+        )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "errors.txt").read_text().splitlines()
+        if line.strip()
+    ]
+    assert rows, f"nothing was recorded for a failure at {stopped_at}"
+    row = rows[0]
+    assert row["partial_inputs"] is True
+    assert "error" in row
+    for key, value in {**environment, **rocket, **flight}.items():
+        assert row[key] == value
+
+
+def test_an_error_before_anything_was_drawn_still_records_the_failure(
+    tmp_path, monkeypatch
+):
+    """With nothing drawn there is nothing to recover, and the row says so."""
+    monkeypatch.setattr(mc, "_claim_next_index", lambda *a, **k: 0)
+    worker = _worker(tmp_path, _MonteCarlo__run_single_simulation=_raise)
+
+    with pytest.raises(_Boom):
+        mc.MonteCarlo._MonteCarlo__sim_producer(
+            worker, object(), _RecordingMutex(), _Event()
+        )
+
+    row = json.loads((tmp_path / "errors.txt").read_text().splitlines()[0])
+    assert "error" in row
+    assert "partial_inputs" not in row

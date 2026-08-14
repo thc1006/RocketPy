@@ -610,6 +610,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         workers. Each sub-stream is handed over as a 128-bit ``int`` (see
         ``_seed_sequence_to_int``) so custom samplers keep working.
         """
+        # Cleared as well as reseeded: a simulation that fails before it draws
+        # would otherwise report the previous one's values as its own, and a
+        # worker keeps the same models for every index it claims.
+        for model in (self.environment, self.rocket, self.flight):
+            model.last_rnd_dict = {}
         env_seed, rocket_seed, flight_seed = child_seed.spawn(3)
         self.environment._set_stochastic(_seed_sequence_to_int(env_seed))
         self.rocket._set_stochastic(_seed_sequence_to_int(rocket_seed))
@@ -732,7 +737,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
                 _record_simulation(
-                    self.input_file, self.output_file, inputs_json, outputs_json
+                    self.input_file,
+                    self.output_file,
+                    inputs_json,
+                    outputs_json,
+                    (self.environment, self.rocket, self.flight),
                 )
                 # The pair is on disk. Cleared before the monitor call so a
                 # failure there reports itself rather than reporting a row that
@@ -752,7 +761,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             # Captured before reporting, which may fail and must not be what
             # gets recorded or raised.
             _record_failure(
-                self._error_file, sim_idx, inputs_json, traceback.format_exc()
+                self._error_file,
+                sim_idx,
+                inputs_json
+                or _inputs_drawn_so_far(
+                    (self.environment, self.rocket, self.flight),
+                    sim_idx,
+                    self._export_config,
+                ),
+                traceback.format_exc(),
             )
             # Bare, so the handler's own line does not join the traceback.
             raise
@@ -890,26 +907,23 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
                 with _manager_mutex(mutex):
                     if error_event.is_set():
-                        # Runs in a worker process spawned via multiprocessing:
-                        # logging handlers configured in the main process are
-                        # not guaranteed to be inherited (e.g. Windows "spawn"),
-                        # so this must use print() to remain visible.
-                        _SimMonitor.reprint(
-                            f"Simulation interrupt. Files from simulation "
-                            f"{sim_idx} saved."
+                        _report_a_cancelled_simulation(
+                            self.error_file, sim_idx, inputs_json
                         )
-                        with open(self.error_file, "a", encoding="utf-8") as f:
-                            f.write(_build_unfinished_record(inputs_json, "cancelled"))
-
                         break
 
                     _record_simulation(
-                        self.input_file, self.output_file, inputs_json, outputs_json
+                        self.input_file,
+                        self.output_file,
+                        inputs_json,
+                        outputs_json,
+                        (self.environment, self.rocket, self.flight),
                     )
                     # Same as the serial path: the pair is on disk, so a failure
                     # in the monitor call below must report itself and not the
                     # row that has just been committed.
                     inputs_json, outputs_json = "", ""
+                    _forget_the_last_draw((self.environment, self.rocket, self.flight))
                     sim_monitor.print_update_status()
 
         except Exception:
@@ -924,6 +938,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
             # The failure goes onto the inputs record rather than replacing it,
             # the same shape the serial path writes.
+            inputs_json = inputs_json or _inputs_drawn_so_far(
+                (self.environment, self.rocket, self.flight),
+                sim_idx,
+                self._export_config,
+            )
             record = _build_error_record(sim_idx, inputs_json, details)
 
             try:
@@ -2396,7 +2415,54 @@ _WORKER_SHUTDOWN_GRACE = 5.0
 _WORKER_POLL_INTERVAL = 0.05
 
 
-def _record_simulation(input_file, output_file, inputs_json, outputs_json):
+def _report_a_cancelled_simulation(error_file, sim_idx, inputs_json):
+    """Note a simulation dropped because a peer had already failed.
+
+    Runs in a worker spawned via multiprocessing, where logging handlers
+    configured in the parent are not guaranteed to be inherited (Windows
+    "spawn"), so this has to print to stay visible.
+    """
+    _SimMonitor.reprint(f"Simulation interrupt. Files from simulation {sim_idx} saved.")
+    with open(error_file, "a", encoding="utf-8") as handle:
+        handle.write(_build_unfinished_record(inputs_json, "cancelled"))
+
+
+def _forget_the_last_draw(models):
+    """Drop what the models drew, once it is on disk or about to be replaced.
+
+    ``_inputs_drawn_so_far`` reads these, so they have to hold the simulation in
+    flight and nothing else: a row already recorded would otherwise be recovered
+    again and reported as the cause of a later failure.
+    """
+    for model in models:
+        model.last_rnd_dict = {}
+
+
+def _inputs_drawn_so_far(models, sim_idx, export_config):
+    """Whatever the models had drawn when a simulation stopped early.
+
+    The whole row is only built once the flight is, so a failure inside
+    ``create_object`` or ``Flight`` itself left the error row carrying a
+    traceback and nothing about the inputs that produced it. Each model fills
+    its own ``last_rnd_dict`` as it goes, so what did get drawn is already
+    there. Marked partial: the draws that never happened are absent, not null.
+
+    Module level for the same reason as ``_record_simulation``: the run paths
+    are driven by stub objects in the tests, which carry no private methods.
+    """
+    try:
+        drawn = dict(item for model in models for item in model.last_rnd_dict.items())
+        if not drawn:
+            return ""
+        drawn["index"] = sim_idx
+        drawn["partial_inputs"] = True
+        return json.dumps(drawn, cls=RocketPyEncoder, **export_config) + "\n"
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A diagnostic must not replace the failure it is describing.
+        return ""
+
+
+def _record_simulation(input_file, output_file, inputs_json, outputs_json, models):
     """Append one simulation's inputs and outputs to their logs.
 
     Module level rather than a method: the run paths are driven directly by
@@ -2406,6 +2472,9 @@ def _record_simulation(input_file, output_file, inputs_json, outputs_json):
         f.write(inputs_json)
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(outputs_json)
+    # The pair is on disk, so what produced it is no longer in flight and
+    # must not be recovered again for a later failure.
+    _forget_the_last_draw(models)
 
 
 def _record_failure(error_file, sim_idx, inputs_json, details):
