@@ -802,13 +802,19 @@ def test_a_keyboard_interrupt_part_way_through_puts_every_log_back(
 
 
 def test_the_logs_keep_the_mode_they_had(tmp_path):
-    """A staged file opens at 0600, which must not narrow the log it replaces."""
+    """A staged file opens at 0600, which must not narrow the log it replaces.
+
+    Compared against what the log had rather than against 0644: Windows honours
+    only the read-only bit, so a file asked for 0644 reports 0666 there and a
+    literal would be testing the platform instead of the carry-over.
+    """
     logs = _three_logs_on_disk(tmp_path, mode=0o644)
+    before = [path.stat().st_mode & 0o777 for path in logs]
 
     mc._create_empty_logs_atomically([str(path) for path in logs])
 
     assert [path.read_bytes() for path in logs] == [b"", b"", b""]
-    assert [path.stat().st_mode & 0o777 for path in logs] == [0o644] * 3
+    assert [path.stat().st_mode & 0o777 for path in logs] == before
     assert not [x for x in tmp_path.iterdir() if x.suffix in (".partial", ".kept")]
 
 
