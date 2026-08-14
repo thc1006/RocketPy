@@ -11,6 +11,7 @@ to survive that.
 """
 
 import json
+import os
 import tempfile
 import threading
 import types
@@ -725,3 +726,77 @@ def test_the_lineage_outlives_the_object_that_wrote_it(tmp_path):
         second._MonteCarlo__capture_root_state(7, appending=True)
 
     assert [w for w in raised if "seed lineage" in str(w.message)]
+
+
+def _three_logs_on_disk(tmp_path, mode=0o644):
+    """Three logs holding a row each, at a mode a caller might have chosen."""
+    logs = []
+    for name in ("run.inputs.txt", "run.outputs.txt", "run.errors.txt"):
+        path = tmp_path / name
+        path.write_text('{"index": 0}\n', encoding="utf-8")
+        os.chmod(path, mode)
+        logs.append(path)
+    return logs
+
+
+@pytest.mark.parametrize("failing_call", [1, 2, 3, 4, 5, 6])
+def test_a_failed_install_puts_every_log_back(tmp_path, monkeypatch, failing_call):
+    """``os.replace`` is atomic for one file, not for three of them.
+
+    Each destination is moved aside and replaced in turn, so a failure part way
+    through used to leave the earlier ones already emptied. Every step is driven
+    to fail here, since which one breaks is not something to assume.
+    """
+    logs = _three_logs_on_disk(tmp_path)
+    before = [path.read_bytes() for path in logs]
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def fail_on_the_chosen_call(source, destination):
+        calls["n"] += 1
+        if calls["n"] == failing_call:
+            raise OSError(13, "injected")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_on_the_chosen_call)
+
+    with pytest.raises(OSError):
+        mc._create_empty_logs_atomically([str(path) for path in logs])
+
+    assert [path.read_bytes() for path in logs] == before
+    assert not [x for x in tmp_path.iterdir() if x.suffix in (".partial", ".kept")]
+
+
+def test_a_keyboard_interrupt_part_way_through_puts_every_log_back(
+    tmp_path, monkeypatch
+):
+    """Rollback has to catch BaseException, not only OSError."""
+    logs = _three_logs_on_disk(tmp_path)
+    before = [path.read_bytes() for path in logs]
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def interrupt_on_the_third(source, destination):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise KeyboardInterrupt
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", interrupt_on_the_third)
+
+    with pytest.raises(KeyboardInterrupt):
+        mc._create_empty_logs_atomically([str(path) for path in logs])
+
+    assert [path.read_bytes() for path in logs] == before
+    assert not [x for x in tmp_path.iterdir() if x.suffix in (".partial", ".kept")]
+
+
+def test_the_logs_keep_the_mode_they_had(tmp_path):
+    """A staged file opens at 0600, which must not narrow the log it replaces."""
+    logs = _three_logs_on_disk(tmp_path, mode=0o644)
+
+    mc._create_empty_logs_atomically([str(path) for path in logs])
+
+    assert [path.read_bytes() for path in logs] == [b"", b"", b""]
+    assert [path.stat().st_mode & 0o777 for path in logs] == [0o644] * 3
+    assert not [x for x in tmp_path.iterdir() if x.suffix in (".partial", ".kept")]

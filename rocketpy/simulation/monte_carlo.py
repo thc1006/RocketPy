@@ -42,35 +42,73 @@ from rocketpy.tools import (
 
 
 # TODO: Create evolution plots to analyze convergence
+def _stage_an_empty_log(destination):
+    """An empty file beside ``destination``, ready to be moved onto it.
+
+    Same directory, so the move is a rename rather than a copy across devices,
+    and at the mode ``destination`` already has: a staged file opens at 0600,
+    which would otherwise narrow a log the caller left readable.
+    """
+    keep_mode = destination.stat().st_mode & 0o7777 if destination.exists() else None
+    handle = tempfile.NamedTemporaryFile(  # pylint: disable=consider-using-with
+        mode="w",
+        encoding="utf-8",
+        dir=destination.parent,
+        prefix=f"{destination.name}.",
+        suffix=".partial",
+        delete=False,
+    )
+    handle.close()
+    if keep_mode is not None:
+        os.chmod(handle.name, keep_mode)
+    return handle.name
+
+
 def _create_empty_logs_atomically(paths):
-    """Put every log in place empty, or leave every one of them alone.
+    """Put every log in place empty, or leave every one of them as it was.
 
     Truncating them one after another empties the first before a bad path or a
-    permission can stop the second, which loses a finished run on the way to
-    raising. Each is staged beside its destination and moved over it only once
-    all of them exist.
+    permission can stop the second. Each is staged beside its destination and
+    installed only once all of them exist, the one it replaces is kept until
+    every install has gone through, and anything already installed is put back
+    if a later one fails.
+
+    Not a filesystem transaction: ``os.replace`` is atomic for one file, and
+    three of them are three atomic steps with a rollback between. A generation
+    directory swapped by a single pointer would be the stronger guarantee, and
+    would change what the three public log paths mean.
     """
-    staged = []
+    staged, moved_aside, created, done = [], [], [], 0
     try:
         for path in paths:
             destination = Path(path)
-            handle = tempfile.NamedTemporaryFile(  # pylint: disable=consider-using-with
-                mode="w",
-                encoding="utf-8",
-                dir=destination.parent,
-                prefix=f"{destination.name}.",
-                suffix=".partial",
-                delete=False,
-            )
-            handle.close()
-            staged.append((handle.name, destination))
-    except OSError as error:
-        for temporary, _ in staged:
-            _best_effort(lambda t=temporary: os.remove(t), "staged log cleanup")
-        raise OSError(f"Error creating files: {error}") from error
+            staged.append((_stage_an_empty_log(destination), destination))
 
-    for temporary, destination in staged:
-        os.replace(temporary, destination)
+        for temporary, destination in staged:
+            # Recorded as each step happens, not after the pair: an install that
+            # fails between them would otherwise leave the original moved aside
+            # with nothing tracking where it went.
+            if destination.exists():
+                kept = f"{temporary}.kept"
+                os.replace(destination, kept)
+                moved_aside.append((destination, kept))
+            else:
+                created.append(destination)
+            os.replace(temporary, destination)
+            done += 1
+    except BaseException as error:
+        for destination, kept in reversed(moved_aside):
+            _best_effort(lambda k=kept, d=destination: os.replace(k, d), "log rollback")
+        for destination in reversed(created):
+            _best_effort(lambda d=destination: os.remove(d), "log rollback")
+        for temporary, _ in staged[done:]:
+            _best_effort(lambda t=temporary: os.remove(t), "staged log cleanup")
+        if isinstance(error, OSError):
+            raise OSError(f"Error creating files: {error}") from error
+        raise
+
+    for _, kept in moved_aside:
+        _best_effort(lambda k=kept: os.remove(k), "replaced log cleanup")
 
 
 def _seed_root_fingerprint(root):
@@ -913,18 +951,12 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         Flight
             The flight object of the simulation.
         """
-        # One draw, not one per argument. Each _randomize_* called
-        # dict_generator again and kept a single key, so the flight took rail
-        # length from the first draw, inclination from the second and heading
-        # from the third, while last_rnd_dict, and so the row written to
-        # .inputs.txt, held only the third (#1090).
-        flight_inputs = next(self.flight.dict_generator())
         return Flight(
             rocket=self.rocket.create_object(),
             environment=self.environment.create_object(),
-            rail_length=flight_inputs["rail_length"],
-            inclination=flight_inputs["inclination"],
-            heading=flight_inputs["heading"],
+            rail_length=self.flight._randomize_rail_length(),
+            inclination=self.flight._randomize_inclination(),
+            heading=self.flight._randomize_heading(),
             initial_solution=self.flight.initial_solution,
             terminate_on_apogee=self.flight.terminate_on_apogee,
             time_overshoot=self.flight.time_overshoot,
