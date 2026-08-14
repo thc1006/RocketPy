@@ -129,22 +129,22 @@ def _seed_root_fingerprint(root):
     )
 
 
-def _warn_when_appending_leaves_the_lineage(previous, previous_chosen, current):
-    """Say so when appended rows stop sharing the seed lineage below them.
+def _refuse_a_root_that_leaves_the_lineage(recorded, current, output_file):
+    """Refuse an append that would put a second lineage in one file.
 
-    A file holding two lineages is valid on every structural check, so nothing
-    else can notice. Only reachable when this object already ran from a chosen
-    seed and is now continuing from a different root (#1075).
+    A warning was not enough. One manifest holds one root, so continuing from a
+    different one leaves the file mixed while the manifest names only the newer
+    half, which is worse than refusing: the provenance is then wrong rather than
+    merely incomplete. Checked before anything is opened.
     """
-    if not previous_chosen or previous is None or previous == current:
+    if recorded == current:
         return
-    warnings.warn(
-        "Appending to a run that was seeded, with a different root. Rows from "
-        "here on derive from a new seed lineage, and the file records both "
-        "without saying which is which. Pass the original random_seed to "
-        "continue the same run.",
-        RuntimeWarning,
-        stacklevel=3,
+    raise ValueError(
+        f"cannot append to {output_file}: it holds simulations from a different "
+        f"root. Appending would put two seed lineages in one file, and a "
+        f"manifest can describe only one. Pass the random_seed the checkpoint "
+        f"was started with, or leave random_seed out to continue from the root "
+        f"already recorded."
     )
 
 
@@ -209,10 +209,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
     __draws_before_this_simulation = ()
     __root_fingerprint = None
     __root_seed_given = False
-    # What the logs on disk actually hold, which only moves once a run has
-    # put rows from its own root into them.
-    __committed_fingerprint = None
-    __committed_seed_given = False
 
     def __init__(
         self,
@@ -522,10 +518,21 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         materializing and pickling the full ``spawn(number_of_simulations)``
         list to each process.
 
+        An append continues the root the logs already hold. Left alone it would
+        start a new one, and the file would end up with two lineages while its
+        manifest could name only the newer, so a different root is refused and
+        no ``random_seed`` at all means continue rather than begin.
+
         Deep-copied, because ``SeedSequence`` keeps a sequence entropy by
         reference. Without it a caller who mutates the list they passed changes
         the children this run derives, which is the opposite of a snapshot.
         """
+        recorded = _recorded_root_state(self.output_file) if appending else None
+        if recorded is not None and random_seed is None:
+            self.__root_state, self.__root_seed_given = recorded
+            self.__root_fingerprint = _fingerprint_of_state(self.__root_state)
+            return
+
         root = self.__root_seed_sequence(random_seed)
         self.__root_state = (
             deepcopy(root.entropy),
@@ -536,19 +543,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # The state above rebuilds children and cannot be compared; the
         # fingerprint compares and cannot rebuild. Both, rather than one.
         self.__root_fingerprint = _seed_root_fingerprint(root)
-        # Whether a caller chose this root or it came from fresh entropy. Only a
-        # chosen one is a lineage there is any point in continuing.
+        # Whether a caller chose this root or it came from fresh entropy.
         self.__root_seed_given = random_seed is not None
-        if appending:
-            # The manifest first: it outlives this object, which the attributes
-            # below do not, and it describes the rows actually in the log.
-            recorded = _fingerprint_from_manifest(self.output_file)
-            previous, previous_chosen = recorded or (
-                self.__committed_fingerprint,
-                self.__committed_seed_given,
-            )
-            _warn_when_appending_leaves_the_lineage(
-                previous, previous_chosen, self.__root_fingerprint
+        if recorded is not None:
+            _refuse_a_root_that_leaves_the_lineage(
+                _fingerprint_of_state(recorded[0]),
+                self.__root_fingerprint,
+                self.output_file,
             )
 
     def __check_this_append_can_continue(self, number_of_simulations):
@@ -575,14 +576,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         """Record that the logs now hold rows derived from this run's root.
 
         Kept apart from capturing it, because the capture runs before anything
-        opens a file. A run that warns and then adds nothing, or that dies before
-        its first row, must leave the logs owned by the root already in them, or
-        the append after it compares against a lineage that was never written.
-        Object-local, so a rebuilt ``MonteCarlo`` starts blank; carrying it in
-        the files is #1075.
+        opens a file. A run that adds nothing, or dies before its first row,
+        must leave the manifest describing the root already in the logs.
         """
-        self.__committed_fingerprint = self.__root_fingerprint
-        self.__committed_seed_given = self.__root_seed_given
         _write_run_manifest(self.output_file, self.__root_state, self.__root_seed_given)
 
     def __child_seed(self, sim_idx):
@@ -2218,9 +2214,11 @@ def _jsonable_entropy(entropy):
 def _write_run_manifest(output_file, root_state, seed_chosen):
     """Record the scheme and the root the rows in this log came from.
 
-    Best effort on the way out: a manifest that cannot be written is worth a
-    warning, not the loss of a finished run. The next append refuses without it,
-    which is the safe direction.
+    Staged beside the manifest and moved onto it, because this is what decides
+    whether a later run may continue the checkpoint at all: a torn write would
+    leave a document that parses as absent or as another generation. Failing to
+    write it is still only a warning, since the alternative is losing a run that
+    finished, and the next append refuses without it either way.
     """
     entropy, spawn_key, pool_size, base = root_state
     document = {
@@ -2236,11 +2234,23 @@ def _write_run_manifest(output_file, root_state, seed_chosen):
         },
     }
     _best_effort(
-        lambda: _manifest_path(output_file).write_text(
-            json.dumps(document, indent=2) + "\n", encoding="utf-8"
-        ),
+        lambda: _install_manifest(_manifest_path(output_file), document),
         "run manifest",
     )
+
+
+def _install_manifest(destination, document):
+    """Put a complete manifest in place, or leave the previous one alone."""
+    staged = f"{destination}.partial"
+    try:
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, destination)
+    except BaseException:
+        _best_effort(lambda: os.remove(staged), "staged manifest cleanup")
+        raise
 
 
 def _read_run_manifest(output_file):
@@ -2253,36 +2263,66 @@ def _read_run_manifest(output_file):
     return document if isinstance(document, dict) else None
 
 
-def _fingerprint_from_manifest(output_file):
-    """``(fingerprint, whether the seed was chosen)`` for the log's own root.
+def _fingerprint_of_state(root_state):
+    """The comparable identity of a stored ``(entropy, spawn_key, pool, base)``."""
+    entropy, spawn_key, pool_size, base = root_state
+    root = np.random.SeedSequence(
+        entropy=entropy, spawn_key=tuple(spawn_key), pool_size=pool_size
+    )
+    return (
+        tuple(int(word) for word in root.generate_state(4, dtype=np.uint32)),
+        tuple(int(key) for key in spawn_key),
+        int(pool_size),
+        int(base),
+    )
 
-    The object that wrote the rows is usually gone by the time an append runs,
-    so this is what makes the lineage check survive a fresh interpreter.
-    ``None`` when there is no manifest or it does not describe a root.
+
+def _root_state_from_manifest(document, output_file):
+    """The root a manifest describes, or a refusal naming what is wrong with it.
+
+    Every field is checked here rather than where it is used. The manifest is
+    what decides whether a checkpoint may be continued at all, so one that
+    parses but does not describe a root has to stop the run rather than leave
+    the append with nothing to compare against.
     """
-    manifest = _read_run_manifest(output_file)
-    if manifest is None:
-        return None
-    recorded = manifest.get("root_state")
-    if not isinstance(recorded, dict):
-        return None
-    try:
-        # Rebuilt for its words only. n_children_spawned is read-only on a
-        # SeedSequence, so it is carried across as the recorded number instead.
-        root = np.random.SeedSequence(
-            entropy=recorded["entropy"],
-            spawn_key=tuple(recorded["spawn_key"]),
-            pool_size=recorded["pool_size"],
+
+    def refuse(what):
+        raise ValueError(
+            f"cannot append to {output_file}: its manifest {what}. Re-run the "
+            f"study to start a checkpoint this release can continue."
         )
-        fingerprint = (
-            tuple(int(word) for word in root.generate_state(4, dtype=np.uint32)),
-            tuple(int(key) for key in recorded["spawn_key"]),
+
+    if document.get("log_format") != "jsonl-v1":
+        refuse(f"names log format {document.get('log_format')!r}, not 'jsonl-v1'")
+    if not isinstance(document.get("seed_chosen"), bool):
+        refuse("has a seed_chosen that is not true or false")
+    recorded = document.get("root_state")
+    if not isinstance(recorded, dict):
+        refuse("carries no root_state")
+    try:
+        state = (
+            recorded["entropy"],
+            tuple(recorded["spawn_key"]),
             int(recorded["pool_size"]),
             int(recorded["n_children_spawned"]),
         )
+        _fingerprint_of_state(state)
     except (KeyError, TypeError, ValueError):
+        refuse("carries a root_state that cannot be rebuilt")
+    return state, document["seed_chosen"]
+
+
+def _recorded_root_state(output_file):
+    """``(root state, whether it was chosen)`` for a log, or ``None``.
+
+    ``None`` only when there is no manifest at all. One that is there but does
+    not describe a root raises from the validation instead of reading as absent,
+    so an append never falls back to starting a lineage of its own.
+    """
+    document = _read_run_manifest(output_file)
+    if document is None:
         return None
-    return fingerprint, bool(manifest.get("seed_chosen", False))
+    return _root_state_from_manifest(document, output_file)
 
 
 def _refuse_a_checkpoint_from_another_scheme(output_file, resume_at):
@@ -2314,6 +2354,7 @@ def _refuse_a_checkpoint_from_another_scheme(output_file, resume_at):
             f"{_SAMPLING_SCHEME!r} at {_MANIFEST_SCHEMA_VERSION}. Re-run the "
             f"study rather than continuing one scheme with another."
         )
+    _root_state_from_manifest(manifest, output_file)
 
 
 def _check_the_checkpoint_supports_appending(input_file, output_file, resume_at):

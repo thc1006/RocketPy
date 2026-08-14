@@ -732,11 +732,14 @@ def test_the_lineage_outlives_the_object_that_wrote_it(tmp_path):
 
     second = object.__new__(MonteCarlo)  # nothing carried over in memory
     second._output_file = output
-    with warnings.catch_warnings(record=True) as raised:
-        warnings.simplefilter("always")
+    with pytest.raises(ValueError, match="different root"):
         second._MonteCarlo__capture_root_state(7, appending=True)
 
-    assert [w for w in raised if "seed lineage" in str(w.message)]
+    third = object.__new__(MonteCarlo)
+    third._output_file = output
+    third._MonteCarlo__capture_root_state(None, appending=True)
+
+    assert third._MonteCarlo__root_fingerprint == first._MonteCarlo__root_fingerprint
 
 
 def _three_logs_on_disk(tmp_path, mode=0o644):
@@ -898,3 +901,53 @@ def test_seeding_marks_what_each_model_was_already_holding():
         model.last_rnd_dict
         for model in (analysis.environment, analysis.rocket, analysis.flight)
     ] == held
+
+
+@pytest.mark.parametrize(
+    "broken, complaint",
+    [
+        ({"log_format": "csv-v1"}, "log format"),
+        ({"seed_chosen": "false"}, "seed_chosen"),
+        ({"root_state": None}, "no root_state"),
+        ({"root_state": {"entropy": 1}}, "cannot be rebuilt"),
+    ],
+)
+def test_a_manifest_that_does_not_describe_a_root_is_refused(
+    tmp_path, broken, complaint
+):
+    """Scheme and version alone were not enough to trust a checkpoint.
+
+    A document naming the right scheme but carrying no usable root passed, and
+    the append then went ahead with nothing to compare its own root against.
+    ``bool("false")`` is True, so a string there read as a chosen seed.
+    """
+    inputs, outputs = _old_parallel_checkpoint(tmp_path)
+    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+    path = mc._manifest_path(str(outputs))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document.update(broken)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=complaint):
+        mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
+
+
+def test_a_failed_manifest_write_leaves_the_previous_one(tmp_path, monkeypatch):
+    """The manifest gates appends now, so a torn write cannot be left behind."""
+    output = str(tmp_path / "run.outputs.txt")
+    mc._write_run_manifest(output, (42, (), 4, 0), True)
+    before = mc._manifest_path(output).read_bytes()
+
+    real_replace = os.replace
+
+    def fail(source, destination):
+        if str(destination).endswith(".manifest.json"):
+            raise OSError(13, "injected")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.warns(RuntimeWarning, match="run manifest"):
+        mc._write_run_manifest(output, (7, (), 4, 0), True)
+
+    assert mc._manifest_path(output).read_bytes() == before
+    assert not list(tmp_path.glob("*.partial"))

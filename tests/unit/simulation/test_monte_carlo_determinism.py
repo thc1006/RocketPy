@@ -376,46 +376,52 @@ SEED_ARRAY = np.array([1, 2, 3], dtype=np.uint32)
 
 
 @pytest.mark.parametrize(
-    "first_seed, second_seed, expect_warning",
+    "first_seed, second_seed, refused",
     [
-        (42, None, True),  # the documented case: seeded run, unseeded append
-        (42, 7, True),  # a different chosen root is the same mixing
+        (42, 7, True),  # a different chosen root would mix two lineages
         (42, 42, False),  # continuing the same run
-        (None, None, False),  # nothing was being preserved
-        # numpy.random.SeedSequence takes array_like[ints], so an ndarray is a
-        # seed this accepts. Comparing two of those elementwise answers with an
-        # array, which is not a verdict, and used to raise here.
-        (SEED_ARRAY, SEED_ARRAY, False),
-        (SEED_ARRAY, np.array([1, 2, 3], dtype=np.uint32), False),
         (SEED_ARRAY, np.array([9, 9, 9], dtype=np.uint32), True),
-        # Same seed, different container: one lineage, so no warning.
+        (SEED_ARRAY, np.array([1, 2, 3], dtype=np.uint32), False),
+        # numpy.random.SeedSequence takes array_like[ints], so comparing two
+        # roots elementwise answers with an array rather than a verdict and used
+        # to raise here. [1, 2, 3] and (1, 2, 3) are one seed, not two.
         ([1, 2, 3], (1, 2, 3), False),
         (np.random.SeedSequence(7), 7, False),
     ],
 )
-def test_appending_says_so_when_it_leaves_the_seed_lineage(
-    first_seed, second_seed, expect_warning, tmp_path
+def test_appending_from_another_root_is_refused(
+    first_seed, second_seed, refused, tmp_path
 ):
-    """Mixing two lineages in one file is invisible to every structural check.
+    """One manifest holds one root, so a file cannot be allowed to hold two.
 
-    The rows stay valid JSON, the indices stay unique and contiguous, and the
-    two files stay in step, so only the roots themselves can tell (#1075).
+    Warning and appending anyway left the file mixed while the manifest named
+    only the newer half, which is a worse answer than refusing: the provenance
+    was then wrong rather than incomplete (#1075).
     """
     analysis = object.__new__(MonteCarlo)
-    # Committing writes the manifest beside this, and the append below reads it.
     analysis._output_file = str(tmp_path / "run.outputs.txt")
     analysis._MonteCarlo__capture_root_state(first_seed)
-    # What simulate does once the first run has put rows in the logs.
     analysis._MonteCarlo__commit_root_lineage()
 
-    with warnings.catch_warnings(record=True) as raised:
-        warnings.simplefilter("always")
+    if refused:
+        with pytest.raises(ValueError, match="different root"):
+            analysis._MonteCarlo__capture_root_state(second_seed, appending=True)
+    else:
         analysis._MonteCarlo__capture_root_state(second_seed, appending=True)
 
-    lineage_warnings = [w for w in raised if "seed lineage" in str(w.message)]
-    assert bool(lineage_warnings) is expect_warning
-    if expect_warning:
-        assert issubclass(lineage_warnings[0].category, RuntimeWarning)
+
+def test_appending_without_a_seed_continues_the_recorded_root(tmp_path):
+    """No random_seed on an append means continue, not start something new."""
+    analysis = object.__new__(MonteCarlo)
+    analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._MonteCarlo__capture_root_state(42)
+    analysis._MonteCarlo__commit_root_lineage()
+    started_with = analysis._MonteCarlo__root_fingerprint
+
+    analysis._MonteCarlo__capture_root_state(None, appending=True)
+
+    assert analysis._MonteCarlo__root_fingerprint == started_with
+    assert analysis._MonteCarlo__root_seed_given is True
 
 
 def test_a_root_that_derives_the_same_children_fingerprints_the_same():
@@ -440,17 +446,15 @@ def test_a_root_that_derives_the_same_children_fingerprints_the_same():
     assert _seed_root_fingerprint(np.random.SeedSequence(43)) != before
 
 
-def test_a_fresh_object_has_no_lineage_to_leave():
-    """A first run cannot be leaving anything, however it is seeded."""
-    with warnings.catch_warnings(record=True) as raised:
-        warnings.simplefilter("always")
-        _warn_when_appending_leaves_the_lineage(
-            MonteCarlo._MonteCarlo__root_state,
-            MonteCarlo._MonteCarlo__root_seed_given,
-            ("entropy", (), 4, 0),
-        )
+def test_a_first_run_has_no_recorded_root_to_continue(tmp_path):
+    """With no manifest beside the log there is nothing to continue or refuse."""
+    analysis = object.__new__(MonteCarlo)
+    analysis._output_file = str(tmp_path / "run.outputs.txt")
 
-    assert not [w for w in raised if "seed lineage" in str(w.message)]
+    analysis._MonteCarlo__capture_root_state(42, appending=True)
+
+    assert analysis._MonteCarlo__root_fingerprint is not None
+    assert analysis._MonteCarlo__root_seed_given is True
 
 
 @pytest.mark.parametrize("keyword", ["batch_size", "max_simulations", "tolerance"])
@@ -503,31 +507,31 @@ def _simulate_without_flying(monkeypatch, analysis, tmp_path):
     return run
 
 
-def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch, tmp_path):
-    """The warning has to survive an append that wrote no rows.
+def test_a_run_that_adds_nothing_leaves_the_manifest_alone(monkeypatch, tmp_path):
+    """An append that reaches its target without running anything changes nothing.
 
     ``simulate`` captures the root before it touches a file, so the object used
-    to believe the new lineage had landed even when the run added nothing. The
-    append after that one silently put rows from the second root behind rows
-    from the first, which is exactly the case the warning exists for (#1075).
+    to believe a new lineage had landed even when the run added no rows.
     """
-    run = _simulate_without_flying(monkeypatch, object.__new__(MonteCarlo), tmp_path)
+    analysis = object.__new__(MonteCarlo)
+    run = _simulate_without_flying(monkeypatch, analysis, tmp_path)
 
-    assert run(2, 42, False) is False  # first run, nothing to leave
-    assert run(2, 7, True) is True  # warns, and adds no rows
-    assert run(4, 7, True) is True  # the one that actually appends seed 7
-    assert run(6, 7, True) is False  # now genuinely the same lineage
+    run(2, 42, False)
+    recorded = mc_module._read_run_manifest(analysis.output_file)
+    run(2, 42, True)  # target already reached, so nothing is added
+
+    assert mc_module._read_run_manifest(analysis.output_file) == recorded
 
 
-def test_a_refused_append_leaves_the_lineage_where_it_was(monkeypatch, tmp_path):
-    """A warning promoted to an error must not still move the tracker."""
+def test_a_refused_append_leaves_the_manifest_where_it_was(monkeypatch, tmp_path):
+    """The refusal has to come before anything on disk moves."""
     analysis = object.__new__(MonteCarlo)
     run = _simulate_without_flying(monkeypatch, analysis, tmp_path)
     run(2, 42, False)
+    recorded = mc_module._read_run_manifest(analysis.output_file)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        with pytest.raises(RuntimeWarning):
-            analysis.simulate(4, append=True, random_seed=7)
+    with pytest.raises(ValueError, match="different root"):
+        analysis.simulate(4, append=True, random_seed=7)
 
-    assert run(4, 7, True) is True, "the files still hold the first lineage"
+    assert mc_module._read_run_manifest(analysis.output_file) == recorded
+    assert recorded["root_state"]["entropy"] == 42
