@@ -865,3 +865,30 @@ def test_nothing_drawn_recovers_nothing():
     empty = [types.SimpleNamespace(last_rnd_dict={}) for _ in range(3)]
 
     assert mc._inputs_drawn_so_far(empty, 3, {}) == ""
+
+
+def test_a_recorded_pair_survives_a_model_that_cannot_be_cleared(tmp_path):
+    """The rows are on disk, so bookkeeping after them must not undo that.
+
+    Forgetting the draw used to raise straight out of ``_record_simulation``,
+    which reported a simulation that had just been written as one that failed.
+    """
+    inputs, outputs = tmp_path / "inputs.txt", tmp_path / "outputs.txt"
+    models = [types.SimpleNamespace(last_rnd_dict={"a": 1}), object()]
+
+    with pytest.warns(RuntimeWarning, match="forgetting a recorded draw"):
+        mc._record_simulation(
+            inputs, outputs, '{"index": 0}\n', '{"index": 0}\n', models
+        )
+
+    assert inputs.read_text() == '{"index": 0}\n'
+    assert outputs.read_text() == '{"index": 0}\n'
+
+
+def test_two_logs_that_differ_only_in_extension_get_their_own_manifest(tmp_path):
+    """``with_suffix`` gave ``run.txt`` and ``run.json`` one manifest between them."""
+    first = mc._manifest_path(str(tmp_path / "run.txt"))
+    second = mc._manifest_path(str(tmp_path / "run.json"))
+
+    assert first != second
+    assert first.name.startswith("run.txt")

@@ -2190,8 +2190,13 @@ _SAMPLING_SCHEME = "per-index-seed-v1"
 
 
 def _manifest_path(output_file):
-    """Where the manifest for a given output log lives."""
-    return Path(output_file).with_suffix(".manifest.json")
+    """Where the manifest for a given output log lives.
+
+    Appended rather than swapped for the suffix, so ``run.txt`` and ``run.json``
+    do not describe themselves with one file, and the pairing stays readable in
+    a directory listing.
+    """
+    return Path(f"{output_file}.manifest.json")
 
 
 def _jsonable_entropy(entropy):
@@ -2472,9 +2477,11 @@ def _record_simulation(input_file, output_file, inputs_json, outputs_json, model
         f.write(inputs_json)
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(outputs_json)
-    # The pair is on disk, so what produced it is no longer in flight and
-    # must not be recovered again for a later failure.
-    _forget_the_last_draw(models)
+    # The pair is on disk, so what produced it is no longer in flight and must
+    # not be recovered again for a later failure. Best effort: the rows are
+    # written, and bookkeeping that raises here would report a simulation that
+    # succeeded as one that failed.
+    _best_effort(lambda: _forget_the_last_draw(models), "forgetting a recorded draw")
 
 
 def _record_failure(error_file, sim_idx, inputs_json, details):
