@@ -206,6 +206,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
     # No run yet, so nothing to continue. Class-level so an instance built
     # without __init__ still answers.
     __root_state = None
+    __draws_before_this_simulation = ()
     __root_fingerprint = None
     __root_seed_given = False
     # What the logs on disk actually hold, which only moves once a run has
@@ -610,11 +611,14 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         workers. Each sub-stream is handed over as a 128-bit ``int`` (see
         ``_seed_sequence_to_int``) so custom samplers keep working.
         """
-        # Cleared as well as reseeded: a simulation that fails before it draws
-        # would otherwise report the previous one's values as its own, and a
-        # worker keeps the same models for every index it claims.
-        for model in (self.environment, self.rocket, self.flight):
-            model.last_rnd_dict = {}
+        # What each model is holding right now, kept by reference. dict_generator
+        # binds a new object every call, so a later failure can tell what this
+        # index published from what the one before it left behind, without
+        # clearing last_rnd_dict, which is documented state.
+        self.__draws_before_this_simulation = [
+            model.last_rnd_dict
+            for model in (self.environment, self.rocket, self.flight)
+        ]
         env_seed, rocket_seed, flight_seed = child_seed.spawn(3)
         self.environment._set_stochastic(_seed_sequence_to_int(env_seed))
         self.rocket._set_stochastic(_seed_sequence_to_int(rocket_seed))
@@ -741,7 +745,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     self.output_file,
                     inputs_json,
                     outputs_json,
-                    (self.environment, self.rocket, self.flight),
                 )
                 # The pair is on disk. Cleared before the monitor call so a
                 # failure there reports itself rather than reporting a row that
@@ -766,6 +769,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 inputs_json
                 or _inputs_drawn_so_far(
                     (self.environment, self.rocket, self.flight),
+                    self.__draws_before_this_simulation,
                     sim_idx,
                     self._export_config,
                 ),
@@ -917,13 +921,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                         self.output_file,
                         inputs_json,
                         outputs_json,
-                        (self.environment, self.rocket, self.flight),
                     )
                     # Same as the serial path: the pair is on disk, so a failure
                     # in the monitor call below must report itself and not the
                     # row that has just been committed.
                     inputs_json, outputs_json = "", ""
-                    _forget_the_last_draw((self.environment, self.rocket, self.flight))
                     sim_monitor.print_update_status()
 
         except Exception:
@@ -940,6 +942,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             # the same shape the serial path writes.
             inputs_json = inputs_json or _inputs_drawn_so_far(
                 (self.environment, self.rocket, self.flight),
+                self.__draws_before_this_simulation,
                 sim_idx,
                 self._export_config,
             )
@@ -2432,31 +2435,30 @@ def _report_a_cancelled_simulation(error_file, sim_idx, inputs_json):
         handle.write(_build_unfinished_record(inputs_json, "cancelled"))
 
 
-def _forget_the_last_draw(models):
-    """Drop what the models drew, once it is on disk or about to be replaced.
+def _inputs_drawn_so_far(models, held_before, sim_idx, export_config):
+    """What the models had published when a simulation stopped early.
 
-    ``_inputs_drawn_so_far`` reads these, so they have to hold the simulation in
-    flight and nothing else: a row already recorded would otherwise be recovered
-    again and reported as the cause of a later failure.
-    """
-    for model in models:
-        model.last_rnd_dict = {}
+    A model publishes ``last_rnd_dict`` once, after its whole attribute loop has
+    finished, so this recovers the models that completed and nothing at all from
+    the one that failed part way through its own draw. Marked partial for that
+    reason rather than for a per-field one.
 
-
-def _inputs_drawn_so_far(models, sim_idx, export_config):
-    """Whatever the models had drawn when a simulation stopped early.
-
-    The whole row is only built once the flight is, so a failure inside
-    ``create_object`` or ``Flight`` itself left the error row carrying a
-    traceback and nothing about the inputs that produced it. Each model fills
-    its own ``last_rnd_dict`` as it goes, so what did get drawn is already
-    there. Marked partial: the draws that never happened are absent, not null.
+    ``held_before`` is what each model was holding when this index was seeded. A
+    model still holding it published nothing here, and its previous values must
+    not be reported as the cause of this failure.
 
     Module level for the same reason as ``_record_simulation``: the run paths
     are driven by stub objects in the tests, which carry no private methods.
     """
     try:
-        drawn = dict(item for model in models for item in model.last_rnd_dict.items())
+        published = [
+            model
+            for model, before in zip(models, held_before)
+            if model.last_rnd_dict is not before
+        ]
+        drawn = dict(
+            item for model in published for item in model.last_rnd_dict.items()
+        )
         if not drawn:
             return ""
         drawn["index"] = sim_idx
@@ -2467,7 +2469,7 @@ def _inputs_drawn_so_far(models, sim_idx, export_config):
         return ""
 
 
-def _record_simulation(input_file, output_file, inputs_json, outputs_json, models):
+def _record_simulation(input_file, output_file, inputs_json, outputs_json):
     """Append one simulation's inputs and outputs to their logs.
 
     Module level rather than a method: the run paths are driven directly by
@@ -2477,11 +2479,6 @@ def _record_simulation(input_file, output_file, inputs_json, outputs_json, model
         f.write(inputs_json)
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(outputs_json)
-    # The pair is on disk, so what produced it is no longer in flight and must
-    # not be recovered again for a later failure. Best effort: the rows are
-    # written, and bookkeeping that raises here would report a simulation that
-    # succeeded as one that failed.
-    _best_effort(lambda: _forget_the_last_draw(models), "forgetting a recorded draw")
 
 
 def _record_failure(error_file, sim_idx, inputs_json, details):

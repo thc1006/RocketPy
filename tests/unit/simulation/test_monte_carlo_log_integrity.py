@@ -292,6 +292,7 @@ def _sim_worker(tmp_path, **overrides):
     attributes = {
         # The failure path recovers what was drawn from these.
         "_export_config": {},
+        "_MonteCarlo__draws_before_this_simulation": ({}, {}, {}),
         "environment": types.SimpleNamespace(last_rnd_dict={}),
         "rocket": types.SimpleNamespace(last_rnd_dict={}),
         "flight": types.SimpleNamespace(last_rnd_dict={}),
@@ -828,61 +829,11 @@ def _models_that_have_drawn():
     ]
 
 
-def test_reseeding_forgets_what_the_simulation_before_it_drew():
-    """A worker keeps its models, so the next index inherits the last one's row.
-
-    Without this, a simulation that failed before drawing anything reported the
-    values of the one before it as the inputs that caused the failure.
-    """
-    analysis = object.__new__(MonteCarlo)
-    analysis.environment, analysis.rocket, analysis.flight = _models_that_have_drawn()
-
-    analysis._MonteCarlo__seed_simulation(np.random.SeedSequence(42))
-
-    assert [
-        model.last_rnd_dict
-        for model in (analysis.environment, analysis.rocket, analysis.flight)
-    ] == [{}, {}, {}]
-
-
-def test_recording_a_pair_forgets_what_produced_it(tmp_path):
-    """Once the row is on disk it is not in flight, so it cannot be recovered.
-
-    ``_inputs_drawn_so_far`` reads the same dicts, and a failure later in the
-    loop would otherwise attach a simulation that had already succeeded to it.
-    """
-    inputs, outputs = tmp_path / "inputs.txt", tmp_path / "outputs.txt"
-    models = _models_that_have_drawn()
-
-    mc._record_simulation(inputs, outputs, '{"index": 0}\n', '{"index": 0}\n', models)
-
-    assert [model.last_rnd_dict for model in models] == [{}, {}, {}]
-    assert inputs.read_text() == '{"index": 0}\n'
-
-
 def test_nothing_drawn_recovers_nothing():
     """The recovery is a best effort, not a source of empty rows."""
     empty = [types.SimpleNamespace(last_rnd_dict={}) for _ in range(3)]
 
-    assert mc._inputs_drawn_so_far(empty, 3, {}) == ""
-
-
-def test_a_recorded_pair_survives_a_model_that_cannot_be_cleared(tmp_path):
-    """The rows are on disk, so bookkeeping after them must not undo that.
-
-    Forgetting the draw used to raise straight out of ``_record_simulation``,
-    which reported a simulation that had just been written as one that failed.
-    """
-    inputs, outputs = tmp_path / "inputs.txt", tmp_path / "outputs.txt"
-    models = [types.SimpleNamespace(last_rnd_dict={"a": 1}), object()]
-
-    with pytest.warns(RuntimeWarning, match="forgetting a recorded draw"):
-        mc._record_simulation(
-            inputs, outputs, '{"index": 0}\n', '{"index": 0}\n', models
-        )
-
-    assert inputs.read_text() == '{"index": 0}\n'
-    assert outputs.read_text() == '{"index": 0}\n'
+    assert mc._inputs_drawn_so_far(empty, [{}, {}, {}], 3, {}) == ""
 
 
 def test_two_logs_that_differ_only_in_extension_get_their_own_manifest(tmp_path):
@@ -892,3 +843,58 @@ def test_two_logs_that_differ_only_in_extension_get_their_own_manifest(tmp_path)
 
     assert first != second
     assert first.name.startswith("run.txt")
+
+
+def test_recovery_takes_the_models_that_published_and_leaves_the_rest():
+    """Recovery is per model, because publication is.
+
+    A model that finished its draw binds a new ``last_rnd_dict``; one that
+    raised part way through is still holding the object it had. Comparing
+    against what was held at seeding tells the two apart without touching that
+    documented state.
+    """
+    finished = types.SimpleNamespace(last_rnd_dict={"wind": 1.0})
+    stale = types.SimpleNamespace(last_rnd_dict={"from_the_run_before": 9.0})
+    failed_mid_draw = types.SimpleNamespace(last_rnd_dict={})
+    held_before = [{}, stale.last_rnd_dict, failed_mid_draw.last_rnd_dict]
+
+    row = json.loads(
+        mc._inputs_drawn_so_far((finished, stale, failed_mid_draw), held_before, 7, {})
+    )
+
+    assert row["wind"] == 1.0
+    assert row["partial_inputs"] is True
+    assert row["index"] == 7
+    assert "from_the_run_before" not in row, "a previous simulation was reported"
+
+
+def test_recovery_reports_nothing_when_no_model_published():
+    """A failure before the first model finished has nothing to recover."""
+    models = [types.SimpleNamespace(last_rnd_dict={"old": 1.0}) for _ in range(3)]
+    held_before = [model.last_rnd_dict for model in models]
+
+    assert mc._inputs_drawn_so_far(models, held_before, 7, {}) == ""
+
+
+def test_seeding_marks_what_each_model_was_already_holding():
+    """The marks are what make a stale draw tellable from a fresh one.
+
+    Taken by reference rather than copied, and taken at seeding rather than
+    after, so nothing has to clear ``last_rnd_dict`` to keep the recovery
+    honest.
+    """
+    analysis = object.__new__(MonteCarlo)
+    held = [{"a": 1}, {"b": 2}, {"c": 3}]
+    analysis.environment, analysis.rocket, analysis.flight = (
+        types.SimpleNamespace(last_rnd_dict=one, _set_stochastic=lambda seed: None)
+        for one in held
+    )
+
+    analysis._MonteCarlo__seed_simulation(np.random.SeedSequence(42))
+
+    marks = analysis._MonteCarlo__draws_before_this_simulation
+    assert [mark is one for mark, one in zip(marks, held)] == [True, True, True]
+    assert [
+        model.last_rnd_dict
+        for model in (analysis.environment, analysis.rocket, analysis.flight)
+    ] == held

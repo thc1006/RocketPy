@@ -60,6 +60,7 @@ def _worker(tmp_path, **overrides):
         # The failure path recovers whatever was drawn from these, so the
         # stand-in has to carry them the way a MonteCarlo does.
         "_export_config": {},
+        "_MonteCarlo__draws_before_this_simulation": ({}, {}, {}),
         "environment": types.SimpleNamespace(last_rnd_dict={}),
         "rocket": types.SimpleNamespace(last_rnd_dict={}),
         "flight": types.SimpleNamespace(last_rnd_dict={}),

@@ -6,6 +6,7 @@ import pytest
 from rocketpy import Environment
 from rocketpy.mathutils.function import Function
 from rocketpy.stochastic import StochasticEnvironment, StochasticFreeFormFins
+from rocketpy.stochastic.custom_sampler import CustomSampler
 from rocketpy.stochastic.stochastic_model import StochasticModel, _snapshot_of
 
 
@@ -246,3 +247,49 @@ def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
     assert _snapshot_of(listed)[0] is not listed[0]  # deep, not shallow
     assert _snapshot_of(function) is function
     assert _snapshot_of(3.0) == 3.0
+
+
+class _RaisesPartWayThrough(CustomSampler):
+    """A sampler that lets the fields before it draw, then fails on its own."""
+
+    def sample(self, n_samples=1):
+        raise TypeError("injected mid-generator failure")
+
+    def reset_seed(self, seed=None):
+        pass
+
+
+def test_a_model_publishes_nothing_when_it_fails_part_way_through(example_plain_env):
+    """``dict_generator`` binds ``last_rnd_dict`` once, after the whole loop.
+
+    Anything recovering inputs from a failed simulation has to know this: a
+    model that raised while drawing has published nothing, so the recovery is
+    per model rather than per field. The tuple ``initial_solution`` in #1109
+    fails this way.
+    """
+    stochastic = StochasticEnvironment(
+        environment=example_plain_env,
+        elevation=(100.0, 1.0),
+        wind_velocity_x_factor=_RaisesPartWayThrough(),
+    )
+    stochastic._set_stochastic(7)
+    before = stochastic.last_rnd_dict
+
+    with pytest.raises(TypeError, match="injected mid-generator failure"):
+        next(stochastic.dict_generator())
+
+    assert stochastic.last_rnd_dict is before, "a failed draw published nothing"
+
+
+def test_a_model_that_finished_publishes_a_new_dictionary(example_plain_env):
+    """The other half: a completed draw replaces the object, so it is tellable."""
+    stochastic = StochasticEnvironment(
+        environment=example_plain_env, elevation=(100.0, 1.0)
+    )
+    stochastic._set_stochastic(7)
+    before = stochastic.last_rnd_dict
+
+    next(stochastic.dict_generator())
+
+    assert stochastic.last_rnd_dict is not before
+    assert "elevation" in stochastic.last_rnd_dict

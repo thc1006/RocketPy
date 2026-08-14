@@ -243,6 +243,9 @@ class _RecordingModel:
 
     def __init__(self):
         self.seeds = []
+        # Every StochasticModel carries this; seeding reads it to mark what was
+        # already published before the index it is about to run.
+        self.last_rnd_dict = {}
 
     def _set_stochastic(self, seed=None):
         self.seeds.append(seed)
@@ -464,7 +467,7 @@ def test_convergence_counts_refuse_a_bool(keyword, boolean):
         MonteCarlo.simulate_convergence(analysis, **{keyword: boolean})
 
 
-def _simulate_without_flying(monkeypatch, analysis):
+def _simulate_without_flying(monkeypatch, analysis, tmp_path):
     """Drive ``simulate`` for its control flow, with the run itself removed.
 
     The defect being covered is an ordering one, so the ordering has to be the
@@ -474,9 +477,11 @@ def _simulate_without_flying(monkeypatch, analysis):
     analysis.num_of_loaded_sims = 0
     # The public setters read the file they are pointed at; the run itself is
     # stubbed out here, so the private attributes are what the getters need.
-    analysis._input_file = "run.inputs.txt"
-    analysis._output_file = "run.outputs.txt"
-    analysis._error_file = "run.errors.txt"
+    # Under tmp_path, not the working directory: committing writes a manifest
+    # beside the output log, and fixed names put it in the repository root.
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
+    analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._error_file = str(tmp_path / "run.errors.txt")
     for name in (
         "_MonteCarlo__setup_files",
         "_MonteCarlo__run_in_serial",
@@ -498,7 +503,7 @@ def _simulate_without_flying(monkeypatch, analysis):
     return run
 
 
-def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch):
+def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch, tmp_path):
     """The warning has to survive an append that wrote no rows.
 
     ``simulate`` captures the root before it touches a file, so the object used
@@ -506,7 +511,7 @@ def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch):
     append after that one silently put rows from the second root behind rows
     from the first, which is exactly the case the warning exists for (#1075).
     """
-    run = _simulate_without_flying(monkeypatch, object.__new__(MonteCarlo))
+    run = _simulate_without_flying(monkeypatch, object.__new__(MonteCarlo), tmp_path)
 
     assert run(2, 42, False) is False  # first run, nothing to leave
     assert run(2, 7, True) is True  # warns, and adds no rows
@@ -514,10 +519,10 @@ def test_a_run_that_adds_nothing_does_not_take_the_files_lineage(monkeypatch):
     assert run(6, 7, True) is False  # now genuinely the same lineage
 
 
-def test_a_refused_append_leaves_the_lineage_where_it_was(monkeypatch):
+def test_a_refused_append_leaves_the_lineage_where_it_was(monkeypatch, tmp_path):
     """A warning promoted to an error must not still move the tracker."""
     analysis = object.__new__(MonteCarlo)
-    run = _simulate_without_flying(monkeypatch, analysis)
+    run = _simulate_without_flying(monkeypatch, analysis, tmp_path)
     run(2, 42, False)
 
     with warnings.catch_warnings():
