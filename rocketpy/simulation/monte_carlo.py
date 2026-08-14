@@ -212,11 +212,14 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             order can differ between runs. Compare by the recorded index rather
             than byte for byte.
 
-            What is reproduced is the sampled inputs, not the whole trajectory.
-            Randomness no stochastic model owns stays outside this tree: a
-            ``Sensor`` left on ``seed=None`` takes fresh entropy per instance,
-            and ``MultivariateRejectionSampler`` draws from the stdlib
-            ``random``. Seed those yourself for a flight that has to replay.
+            What is reproduced is the draw each index makes, not a transcript of
+            what reached ``Flight``: #1090 still draws the ``StochasticFlight``
+            dictionary more than once. ``append=True`` does not carry its seed
+            lineage either (#1075), and ``simulate_convergence`` seeds neither
+            its batches nor its bootstrap resampling (#1077), so a convergence
+            study is outside this guarantee. Randomness that reaches a flight
+            from anywhere but a stochastic model, a user callback most likely,
+            is outside it as well.
 
             With ``include_function_data=True`` a record also carries a
             ``Function``'s signature hash and serialised source, which describe
