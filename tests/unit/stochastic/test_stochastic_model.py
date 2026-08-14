@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 
 from rocketpy import Environment
+from rocketpy.mathutils.function import Function
 from rocketpy.stochastic import StochasticEnvironment, StochasticFreeFormFins
-from rocketpy.stochastic.stochastic_model import StochasticModel
+from rocketpy.stochastic.stochastic_model import StochasticModel, _snapshot_of
 
 
 def _sampled_option(model):
@@ -215,3 +216,33 @@ def test_the_nominal_is_the_one_the_model_was_built_with(example_plain_env):
     assert model.elevation[0] == around_first == 1000, (
         "the model followed the object instead of the value it was built with"
     )
+
+
+def test_a_mutable_nominal_survives_a_write_through_the_object(calisto_free_form_fins):
+    """Writing through the wrapped object must not move the nominal.
+
+    The cache held the object itself, so ``obj.outline[:] = ...`` reached it and
+    a value the model is supposed to sample around moved underneath it.
+    """
+    stochastic = StochasticFreeFormFins(
+        free_form_fins=calisto_free_form_fins, shape_points=0.001
+    )
+    stochastic._set_stochastic(7)
+    expected = list(stochastic._nominal("shape_points", getattr))
+
+    stochastic.obj.shape_points[:] = [(9.9, 9.9)] * len(stochastic.obj.shape_points)
+
+    assert list(stochastic._nominal("shape_points", getattr)) == expected
+
+
+def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
+    """Only containers are copied, so the rule can be stated as it behaves."""
+    array = np.array([1.0, 2.0])
+    listed = [[1.0], [2.0]]
+    function = Function(lambda x: x)
+
+    assert _snapshot_of(array) is not array
+    assert _snapshot_of(listed) is not listed
+    assert _snapshot_of(listed)[0] is not listed[0]  # deep, not shallow
+    assert _snapshot_of(function) is function
+    assert _snapshot_of(3.0) == 3.0

@@ -16,6 +16,7 @@ latest documentation.
 import csv
 import json
 import os
+import tempfile
 import traceback
 import warnings
 from contextlib import contextmanager
@@ -39,7 +40,58 @@ from rocketpy.tools import (
     import_optional_dependency,
 )
 
+
 # TODO: Create evolution plots to analyze convergence
+def _create_empty_logs_atomically(paths):
+    """Put every log in place empty, or leave every one of them alone.
+
+    Truncating them one after another empties the first before a bad path or a
+    permission can stop the second, which loses a finished run on the way to
+    raising. Each is staged beside its destination and moved over it only once
+    all of them exist.
+    """
+    staged = []
+    try:
+        for path in paths:
+            destination = Path(path)
+            handle = tempfile.NamedTemporaryFile(  # pylint: disable=consider-using-with
+                mode="w",
+                encoding="utf-8",
+                dir=destination.parent,
+                prefix=f"{destination.name}.",
+                suffix=".partial",
+                delete=False,
+            )
+            handle.close()
+            staged.append((handle.name, destination))
+    except OSError as error:
+        for temporary, _ in staged:
+            _best_effort(lambda t=temporary: os.remove(t), "staged log cleanup")
+        raise OSError(f"Error creating files: {error}") from error
+
+    for temporary, destination in staged:
+        os.replace(temporary, destination)
+
+
+def _warn_when_appending_leaves_the_lineage(previous, previous_chosen, current):
+    """Say so when appended rows stop sharing the seed lineage below them.
+
+    A file holding two lineages is valid on every structural check, so nothing
+    else can notice. Only reachable when this object already ran from a chosen
+    seed and is now continuing from a different root (#1075).
+    """
+    if not previous_chosen or previous is None or previous == current:
+        return
+    warnings.warn(
+        "Appending to a run that was seeded, with a different root. Rows from "
+        "here on derive from a new seed lineage, and the file records both "
+        "without saying which is which. Pass the original random_seed to "
+        "continue the same run.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 # Written by the run itself and used to pair an inputs row with its outputs row.
 # A collector that supplies one can relabel a row without tripping any check.
 _RESERVED_RECORD_KEYS = frozenset({"index"})
@@ -94,6 +146,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         The total CPU time spent running the simulation, excluding the time
         spent waiting for I/O operations or other processes to complete.
     """
+
+    # No run yet, so nothing to continue. Class-level so an instance built
+    # without __init__ still answers.
+    __root_state = None
+    __root_seed_given = False
 
     def __init__(
         self,
@@ -191,9 +248,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         append : bool, optional
             If True, resume the existing files. ``number_of_simulations`` is
             then the target total rather than a number to add, and a value
-            below what the files already hold is refused. The root seed is not
-            stored in them, so pass the same ``random_seed`` to keep the
-            streams. If False, the files will be overwritten. Default is False.
+            below what the files already hold is refused. This is not a
+            reproducible resume: the root is not stored in the files, so pass
+            the same ``random_seed`` to stay on one lineage. Continuing from a
+            different root warns, but only within the object that ran both
+            (#1075). If False, the files will be overwritten. Default is False.
         parallel : bool, optional
             If True, the simulations will be run in parallel. Default is False.
         n_workers : int, optional
@@ -321,7 +380,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # This validates random_seed *before* __setup_files truncates any
         # existing output, so an invalid seed cannot destroy prior results on
         # the way to raising.
-        self.__capture_root_state(random_seed)
+        self.__capture_root_state(random_seed, appending=append)
 
         print("Starting Monte Carlo analysis")
 
@@ -349,18 +408,22 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         -------
         None
         """
-        # Create data files for inputs, outputs and error logging
-        open_mode = "r+" if append else "w+"
+        if not append:
+            _create_empty_logs_atomically(
+                (self._input_file, self._output_file, self._error_file)
+            )
+            return
 
+        # Resuming reads only, so nothing here can damage what is already there.
         try:
-            with open(self._input_file, open_mode, encoding="utf-8") as input_file:
+            with open(self._input_file, "r+", encoding="utf-8") as input_file:
                 idx_i = len(input_file.readlines())
-            with open(self._output_file, open_mode, encoding="utf-8") as output_file:
+            with open(self._output_file, "r+", encoding="utf-8") as output_file:
                 idx_o = len(output_file.readlines())
-            with open(self._error_file, open_mode, encoding="utf-8"):
+            with open(self._error_file, "r+", encoding="utf-8"):
                 pass
 
-            if idx_i != idx_o and not append:
+            if idx_i != idx_o:
                 warnings.warn(
                     "Input and output files are not synchronized", UserWarning
                 )
@@ -395,7 +458,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
         return np.random.SeedSequence(random_seed)
 
-    def __capture_root_state(self, random_seed):
+    def __capture_root_state(self, random_seed, appending=False):
         """Capture the small, picklable root seed state for this run.
 
         Stored once so serial mode and every parallel worker derive the same
@@ -407,6 +470,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         reference. Without it a caller who mutates the list they passed changes
         the children this run derives, which is the opposite of a snapshot.
         """
+        previous, previous_chosen = self.__root_state, self.__root_seed_given
         root = self.__root_seed_sequence(random_seed)
         self.__root_state = (
             deepcopy(root.entropy),
@@ -414,6 +478,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             root.pool_size,
             root.n_children_spawned,
         )
+        # Whether a caller chose this root or it came from fresh entropy. Only a
+        # chosen one is a lineage there is any point in continuing.
+        self.__root_seed_given = random_seed is not None
+        if appending:
+            _warn_when_appending_leaves_the_lineage(
+                previous, previous_chosen, self.__root_state
+            )
 
     def __child_seed(self, sim_idx):
         """Return the seed sequence for a single simulation index.

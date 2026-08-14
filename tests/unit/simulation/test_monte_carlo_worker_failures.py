@@ -9,10 +9,10 @@ raised ``UnboundLocalError`` over the real error while holding the mutex, and
 """
 
 import json
-import traceback
-import warnings
 import threading
+import traceback
 import types
+import warnings
 
 import pytest
 

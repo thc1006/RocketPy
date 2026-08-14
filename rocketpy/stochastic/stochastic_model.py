@@ -3,12 +3,29 @@ Defines the `StochasticModel` class, which is used as a base class for all other
 Stochastic classes.
 """
 
+from copy import deepcopy
+
 import numpy as np
 
 from rocketpy.mathutils.function import Function
 from rocketpy.stochastic.custom_sampler import CustomSampler
 
 from ..tools import get_distribution
+
+
+def _snapshot_of(value):
+    """A nominal that writing through the wrapped object cannot reach.
+
+    Containers are copied, since ``obj.outline[:] = ...`` would otherwise move
+    the value this is meant to hold still. Anything else is kept by reference:
+    nothing here mutates a ``Function`` or a motor in place, and copying one per
+    model would cost more than it protects.
+    """
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, (list, dict, set)):
+        return deepcopy(value)
+    return value
 
 
 def _names_as_spawn_key(input_names):
@@ -126,31 +143,26 @@ class StochasticModel:
         self._set_stochastic(seed)
 
     def _nominal(self, input_name, getter=getattr):
-        """``self.obj``'s value for ``input_name``, as it was when this model
-        was built.
+        """``self.obj``'s value for ``input_name`` as it was when built.
 
-        Read once and remembered, because ``StochasticEnvironment`` has
-        ``create_object`` write the randomised value back onto ``self.obj``
-        instead of building a copy. Re-reading it on a reseed would take one
-        simulation's output as the next one's nominal, and a factor would
-        multiply the factor before it rather than the original value.
+        Read once and kept, because ``StochasticEnvironment.create_object``
+        writes the randomised value back onto ``self.obj``. Re-reading it on a
+        reseed would take one simulation's output as the next one's nominal, so
+        a factor would multiply the factor before it. Containers are copied on
+        the way in, so rebinding the attribute and writing through it both leave
+        this where it was; anything else is held by reference and follows the
+        object (see ``_snapshot_of``).
 
-        A custom ``getter`` reads a component's own attribute rather than one
-        of ``self.obj``'s, and nothing writes back to those, so it is passed
-        straight through. Caching it here would be wrong as well: every
-        component's position arrives under the one name ``"position"``.
-
-        This applies to every stochastic model, not only the environment: what
-        a model samples around is what the wrapped object held when the model
-        was built. Changing the object afterwards does not move it. Only
-        ``StochasticEnvironment.create_object`` writes back today, but the rule
-        is stated for all of them rather than special-cased for one, so a model
-        means the same thing whichever object it wraps.
+        A custom ``getter`` reads a component's own attribute, which nothing
+        writes back to, so it passes straight through. Caching those would be
+        wrong anyway: every component's position arrives under one name.
         """
         if getter is not getattr:
             return getter(self.obj, input_name)
         if input_name not in self.__nominal_values:
-            self.__nominal_values[input_name] = getattr(self.obj, input_name)
+            self.__nominal_values[input_name] = _snapshot_of(
+                getattr(self.obj, input_name)
+            )
         return self.__nominal_values[input_name]
 
     def _set_stochastic(self, seed=None):

@@ -28,6 +28,7 @@ import random as stdlib_random
 import sys
 import threading
 import time
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,6 +40,7 @@ from rocketpy.simulation.monte_carlo import (
     _seed_sequence_to_int,
     _SimMonitor,
     _validate_simulation_count,
+    _warn_when_appending_leaves_the_lineage,
 )
 
 _root_seed_sequence = MonteCarlo._MonteCarlo__root_seed_sequence
@@ -363,3 +365,51 @@ def test_mutating_the_caller_s_entropy_does_not_move_the_captured_root(wrapped):
     entropy[0] = 999999
 
     assert _entropy(_child_seed(runner, 7)) == before
+
+
+@pytest.mark.parametrize(
+    "first_seed, second_seed, expect_warning",
+    [
+        (42, None, True),  # the documented case: seeded run, unseeded append
+        (42, 7, True),  # a different chosen root is the same mixing
+        (42, 42, False),  # continuing the same run
+        (None, None, False),  # nothing was being preserved
+    ],
+)
+def test_appending_says_so_when_it_leaves_the_seed_lineage(
+    first_seed, second_seed, expect_warning
+):
+    """Mixing two lineages in one file is invisible to every structural check.
+
+    The rows stay valid JSON, the indices stay unique and contiguous, and the
+    two files stay in step, so only the roots themselves can tell (#1075).
+    """
+    analysis = object.__new__(MonteCarlo)
+    analysis._MonteCarlo__capture_root_state(first_seed)
+    previous_root = analysis._MonteCarlo__root_state
+    previous_chosen = analysis._MonteCarlo__root_seed_given
+    analysis._MonteCarlo__capture_root_state(second_seed)
+
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        _warn_when_appending_leaves_the_lineage(
+            previous_root, previous_chosen, analysis._MonteCarlo__root_state
+        )
+
+    lineage_warnings = [w for w in raised if "seed lineage" in str(w.message)]
+    assert bool(lineage_warnings) is expect_warning
+    if expect_warning:
+        assert issubclass(lineage_warnings[0].category, RuntimeWarning)
+
+
+def test_a_fresh_object_has_no_lineage_to_leave():
+    """A first run cannot be leaving anything, however it is seeded."""
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        _warn_when_appending_leaves_the_lineage(
+            MonteCarlo._MonteCarlo__root_state,
+            MonteCarlo._MonteCarlo__root_seed_given,
+            ("entropy", (), 4, 0),
+        )
+
+    assert not [w for w in raised if "seed lineage" in str(w.message)]

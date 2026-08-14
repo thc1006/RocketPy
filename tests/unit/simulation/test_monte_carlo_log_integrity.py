@@ -11,12 +11,14 @@ to survive that.
 """
 
 import json
+import tempfile
 import threading
 import types
 
 import pytest
 
 import rocketpy.simulation.monte_carlo as mc
+from rocketpy.simulation import MonteCarlo
 
 
 def _runner(tmp_path, rows, outputs=None, count=2, initial=0, interrupted=False):
@@ -556,3 +558,57 @@ def test_a_collector_changed_after_construction_is_checked_again(tmp_path):
 
     assert inputs.read_text(encoding="utf-8") == "previous input\n"
     assert outputs.read_text(encoding="utf-8") == "previous output\n"
+
+
+def test_a_failed_log_leaves_every_other_log_as_it_was(tmp_path, monkeypatch):
+    """One unwritable log must not cost the run that is already on disk.
+
+    The logs used to be truncated one after another, so a permission error on
+    the second emptied the first on the way to raising.
+    """
+    logs = []
+    for name in ("run.inputs.txt", "run.outputs.txt", "run.errors.txt"):
+        path = tmp_path / name
+        path.write_text('{"index": 0}\n', encoding="utf-8")
+        logs.append(path)
+    before = [path.read_bytes() for path in logs]
+
+    real = tempfile.NamedTemporaryFile
+    calls = {"n": 0}
+
+    def fail_on_the_second(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise PermissionError(13, "Permission denied")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", fail_on_the_second)
+
+    analysis = object.__new__(MonteCarlo)
+    analysis._input_file, analysis._output_file, analysis._error_file = (
+        str(path) for path in logs
+    )
+
+    with pytest.raises(OSError):
+        analysis._MonteCarlo__setup_files(append=False)
+
+    assert [path.read_bytes() for path in logs] == before
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_the_logs_are_emptied_when_every_one_of_them_can_be_written(tmp_path):
+    """The ordinary path still leaves three empty logs behind."""
+    logs = []
+    for name in ("run.inputs.txt", "run.outputs.txt", "run.errors.txt"):
+        path = tmp_path / name
+        path.write_text('{"index": 0}\n', encoding="utf-8")
+        logs.append(path)
+
+    analysis = object.__new__(MonteCarlo)
+    analysis._input_file, analysis._output_file, analysis._error_file = (
+        str(path) for path in logs
+    )
+    analysis._MonteCarlo__setup_files(append=False)
+
+    assert [path.read_bytes() for path in logs] == [b"", b"", b""]
+    assert not list(tmp_path.glob("*.partial"))
