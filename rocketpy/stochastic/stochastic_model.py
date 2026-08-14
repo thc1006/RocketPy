@@ -585,39 +585,30 @@ class StochasticModel:
                 )
 
     def _reset_custom_samplers(self, seed):
-        """Give each sampler its own stream, and each shared group one between
-        them.
+        """Seed each sampler, and each shared generator once.
 
-        Samplers that share a generator, as the documented wind pair do, are
-        seeded once as a unit. Resetting each member in turn would leave every
-        seed but the last discarded and the group's stream decided by whichever
-        member happened to go last.
-
-        Its own pass rather than the validation loop below, whose order sets
-        ``__dict__`` and so the order every other input is drawn in.
+        Kept out of the validation loop in ``_set_stochastic``, whose order
+        sets ``__dict__`` and with it the order every other input is drawn in.
         """
         groups = {}
         for input_name in sorted(self.__stochastic_dict):
             sampler = self.__stochastic_dict[input_name]
             if isinstance(sampler, CustomSampler):
-                # Held in the value as well as keyed on, because `id` is
-                # unique only among live objects. Defensive: a `seed_group`
-                # that builds its answer did not merge in practice here.
+                # Kept in the value too: `id` is unique only among live
+                # objects, so the group has to outlive the dict.
                 group = sampler.seed_group
                 shared = groups.setdefault(id(group), ([], sampler, group))
                 shared[0].append(input_name)
 
         for names, sampler, group in groups.values():
-            # The group itself when it can be reset, since it is the thing that
-            # holds the shared state. Going through one member instead assumes
-            # every member resets the same way and keeps nothing of its own.
+            # The group holds the shared state, so reset it directly; a member
+            # may reset differently, or keep state of its own.
             resetter = group if hasattr(group, "reset_seed") else sampler
             try:
                 resetter.reset_seed(_sampler_seed(seed, names))
             except Exception as error:
-                # Not just RuntimeError. The seed handed over is now 128 bits,
-                # which the legacy RandomState refuses with a ValueError, and a
-                # bare one of those does not say which sampler raised it.
+                # Broad: the seed is 128 bits, which legacy RandomState refuses
+                # with a ValueError that does not name the sampler.
                 raise RuntimeError(
                     f"An error occurred in the 'reset_seed' method of the "
                     f"CustomSampler for {', '.join(names)}"
@@ -627,9 +618,7 @@ class StochasticModel:
         """
         Validate a custom sampler.
 
-        Seeding is not done here. It happens in ``_reset_custom_samplers``,
-        which runs in a fixed order because two samplers can share one
-        generator and whichever is reset last decides the stream.
+        Seeding happens in ``_reset_custom_samplers``, not here.
 
         Parameters
         ----------
@@ -643,9 +632,8 @@ class StochasticModel:
         AssertionError
             If the input is not in a valid format.
         """
-        # Raised rather than asserted, the same way #1103 handles it: `python -O`
-        # strips an assert, and the documented AssertionError is kept so callers
-        # that already catch it still do.
+        # Raised, not asserted: `python -O` strips asserts. AssertionError is
+        # kept so callers that catch it still do. Same as #1103.
         if not isinstance(sampler, CustomSampler):
             raise AssertionError(
                 f"`{input_name}` must be a CustomSampler, not {type(sampler).__name__}"
