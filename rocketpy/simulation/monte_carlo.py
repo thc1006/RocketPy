@@ -853,12 +853,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         Flight
             The flight object of the simulation.
         """
+        # One draw, not one per argument. Each _randomize_* called
+        # dict_generator again and kept a single key, so the flight took rail
+        # length from the first draw, inclination from the second and heading
+        # from the third, while last_rnd_dict, and so the row written to
+        # .inputs.txt, held only the third (#1090).
+        flight_inputs = next(self.flight.dict_generator())
         return Flight(
             rocket=self.rocket.create_object(),
             environment=self.environment.create_object(),
-            rail_length=self.flight._randomize_rail_length(),
-            inclination=self.flight._randomize_inclination(),
-            heading=self.flight._randomize_heading(),
+            rail_length=flight_inputs["rail_length"],
+            inclination=flight_inputs["inclination"],
+            heading=flight_inputs["heading"],
             initial_solution=self.flight.initial_solution,
             terminate_on_apogee=self.flight.terminate_on_apogee,
             time_overshoot=self.flight.time_overshoot,

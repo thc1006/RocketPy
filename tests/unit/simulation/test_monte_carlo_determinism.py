@@ -427,3 +427,49 @@ def test_convergence_counts_refuse_a_bool(keyword, boolean):
 
     with pytest.raises(ValueError, match=keyword):
         MonteCarlo.simulate_convergence(analysis, **{keyword: boolean})
+
+
+def test_the_flight_flies_the_inputs_that_get_logged(monkeypatch):
+    """The logged row must be the row the ``Flight`` was built from.
+
+    Each argument used to call ``dict_generator`` again and keep one key, so the
+    flight took rail length from the first draw, inclination from the second and
+    heading from the third, while ``last_rnd_dict`` held only the third (#1090).
+    """
+    drawn = [
+        {"rail_length": 5.0, "inclination": 84.0, "heading": 133.0},
+        {"rail_length": 6.0, "inclination": 85.0, "heading": 134.0},
+        {"rail_length": 7.0, "inclination": 86.0, "heading": 135.0},
+    ]
+
+    # A fresh generator per call, over one advancing stream: that is what the
+    # real dict_generator does, and a stub that restarts each time would pass
+    # whether the draw happens once or three times.
+    taken = []
+
+    def generator():
+        row = drawn[len(taken)]
+        taken.append(row)
+        stochastic_flight.last_rnd_dict = row
+        yield row
+
+    stochastic_flight = SimpleNamespace(
+        dict_generator=generator,
+        last_rnd_dict={},
+        initial_solution=None,
+        terminate_on_apogee=False,
+        time_overshoot=True,
+    )
+    analysis = object.__new__(MonteCarlo)
+    analysis.flight = stochastic_flight
+    analysis.rocket = SimpleNamespace(create_object=lambda: "rocket")
+    analysis.environment = SimpleNamespace(create_object=lambda: "environment")
+    monkeypatch.setattr("rocketpy.simulation.monte_carlo.Flight", SimpleNamespace)
+
+    flight = MonteCarlo._MonteCarlo__run_single_simulation(analysis)
+
+    logged = stochastic_flight.last_rnd_dict
+    assert flight.rail_length == logged["rail_length"]
+    assert flight.inclination == logged["inclination"]
+    assert flight.heading == logged["heading"]
+    assert logged == drawn[0], "one draw, so the row logged is the first one"

@@ -784,6 +784,11 @@ class StochasticRocket(StochasticModel):
         """Creates and returns a Rocket object from the randomly generated input
         arguments.
 
+        Motors, aerodynamic surfaces, air brakes and their controllers, rail
+        buttons and parachutes are carried onto the new rocket. Sensors are not:
+        one added to the wrapped rocket does not reach a Monte Carlo flight, and
+        so cannot affect it either.
+
         Returns
         -------
         rocket : Rocket
