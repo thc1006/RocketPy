@@ -212,15 +212,19 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             order can differ between runs. Compare by the recorded index rather
             than byte for byte.
 
-            What is reproduced is the sampled values. With
-            ``include_function_data=True`` a record also carries a
+            What is reproduced is the sampled inputs, not the whole trajectory.
+            Randomness no stochastic model owns stays outside this tree: a
+            ``Sensor`` left on ``seed=None`` takes fresh entropy per instance,
+            and ``MultivariateRejectionSampler`` draws from the stdlib
+            ``random``. Seed those yourself for a flight that has to replay.
+
+            With ``include_function_data=True`` a record also carries a
             ``Function``'s signature hash and serialised source, which describe
             the object rather than the value drawn for it, so a run under
             ``spawn`` or ``forkserver`` writes different ones for the same
-            inputs. Measured on a real run, six fields differ across that
-            boundary and all six are these. Pass
-            ``include_function_data=False`` when the records need to compare
-            field for field.
+            inputs. Six fields differ across that boundary, all of them these.
+            Pass ``include_function_data=False`` when the records need to
+            compare field for field.
 
             Reproducibility is also scoped to one environment. NumPy promises a
             stream only for the same BitGenerator, seed, call sequence, build
