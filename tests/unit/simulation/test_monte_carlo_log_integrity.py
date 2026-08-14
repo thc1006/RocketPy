@@ -612,3 +612,39 @@ def test_the_logs_are_emptied_when_every_one_of_them_can_be_written(tmp_path):
 
     assert [path.read_bytes() for path in logs] == [b"", b"", b""]
     assert not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("status", ["cancelled", "interrupted"])
+def test_a_row_that_did_not_finish_says_which_way_it_stopped(status):
+    """Three ways a row lands in the error file, and they must be tellable apart.
+
+    A simulation that raised carries ``error``; one dropped because a peer
+    crashed or the user interrupted carried nothing, so it read as a success
+    with no error attached.
+    """
+    row = json.loads(mc._build_unfinished_record('{"index": 3, "a": 1}', status))
+
+    assert row["status"] == status
+    assert row["index"] == 3  # the inputs are kept, not replaced
+    assert "error" not in row
+
+
+def test_an_unreadable_input_row_still_reports_its_status():
+    """The marker matters most when the inputs could not be written."""
+    row = json.loads(mc._build_unfinished_record("not json at all", "cancelled"))
+
+    assert row == {"status": "cancelled"}
+
+
+def test_a_failed_simulation_is_not_labelled_as_stopped():
+    """A real exception keeps ``error`` and gains no status, so the three differ."""
+    row = json.loads(mc._build_error_record(5, '{"index": 5}', "boom"))
+
+    assert row["error"] == "boom"
+    assert "status" not in row
+
+
+def test_nothing_in_flight_writes_no_row_at_all():
+    """An interrupt between two simulations has nothing to mark."""
+    assert mc._build_unfinished_record("", "interrupted") == ""
+    assert mc._build_unfinished_record(None, "cancelled") == ""

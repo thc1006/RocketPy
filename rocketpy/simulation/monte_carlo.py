@@ -801,7 +801,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                             f"{sim_idx} saved."
                         )
                         with open(self.error_file, "a", encoding="utf-8") as f:
-                            f.write(inputs_json)
+                            f.write(_build_unfinished_record(inputs_json, "cancelled"))
 
                         break
 
@@ -979,16 +979,21 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
         # Validate inputs up-front. Without this, a non-positive batch_size makes
         # the loop run zero new simulations every iteration and spin forever.
-        if not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
+        if not _is_whole_number(batch_size) or batch_size <= 0:
             raise ValueError(
                 f"'batch_size' must be a positive integer, got {batch_size!r}."
             )
-        if not isinstance(max_simulations, (int, np.integer)) or max_simulations <= 0:
+        if not _is_whole_number(max_simulations) or max_simulations <= 0:
             raise ValueError(
                 f"'max_simulations' must be a positive integer, got "
                 f"{max_simulations!r}."
             )
-        if not isinstance(tolerance, (int, float)) or tolerance <= 0:
+        # bool is an int to isinstance, so True would pass as a tolerance of 1.
+        if (
+            isinstance(tolerance, (bool, np.bool_))
+            or not isinstance(tolerance, (int, float))
+            or tolerance <= 0
+        ):
             raise ValueError(
                 f"'tolerance' must be a positive number, got {tolerance!r}."
             )
@@ -2193,6 +2198,25 @@ def _record_failure(error_file, sim_idx, inputs_json, details):
         )
 
 
+def _build_unfinished_record(inputs_json, status):
+    """One simulation that stopped before it could either fail or finish.
+
+    Marked, because an unmarked row reads as a simulation with no error, and a
+    reader cannot otherwise tell a peer's crash from a keyboard interrupt.
+
+    Nothing in flight means nothing to report, so an empty payload stays empty
+    rather than becoming a row about a simulation that never started.
+    """
+    if not inputs_json:
+        return ""
+    try:
+        record = json.loads(inputs_json)
+    except (TypeError, ValueError):
+        record = {}
+    record["status"] = status
+    return json.dumps(record) + "\n"
+
+
 def _build_error_record(sim_idx, inputs_json, details):
     """One failed simulation as a row: what it drew, and what went wrong.
 
@@ -2262,7 +2286,7 @@ def _write_unfinished_inputs(error_file, inputs_json):
     """Module level for the same reason as ``_record_simulation``: the run paths
     are driven by stub objects in the tests, which carry no private methods."""
     with open(error_file, "a", encoding="utf-8") as f:
-        f.write(inputs_json)
+        f.write(_build_unfinished_record(inputs_json, "interrupted"))
 
 
 def _say_so_without_raising(message):

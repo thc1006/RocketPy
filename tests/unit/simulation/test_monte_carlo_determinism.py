@@ -413,3 +413,17 @@ def test_a_fresh_object_has_no_lineage_to_leave():
         )
 
     assert not [w for w in raised if "seed lineage" in str(w.message)]
+
+
+@pytest.mark.parametrize("keyword", ["batch_size", "max_simulations", "tolerance"])
+@pytest.mark.parametrize("boolean", [True, False])
+def test_convergence_counts_refuse_a_bool(keyword, boolean):
+    """``isinstance(True, int)`` holds, so a bool used to pass as 1 or 0.
+
+    ``simulate`` already refuses one through ``_is_whole_number``; the
+    convergence entry point checked with a plain ``isinstance`` and did not.
+    """
+    analysis = object.__new__(MonteCarlo)
+
+    with pytest.raises(ValueError, match=keyword):
+        MonteCarlo.simulate_convergence(analysis, **{keyword: boolean})
