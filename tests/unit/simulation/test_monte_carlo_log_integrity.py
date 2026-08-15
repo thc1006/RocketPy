@@ -12,6 +12,7 @@ to survive that.
 
 import json
 import os
+import pathlib
 import tempfile
 import threading
 import types
@@ -662,6 +663,18 @@ def test_nothing_in_flight_writes_no_row_at_all():
     assert mc._build_unfinished_record(None, "cancelled") == ""
 
 
+def _generation(output, root=(42, (), 4, 0), count=0, inputs=None):
+    """The record a run keeps about the logs it owns."""
+    return {
+        "run_id": "0123456789abcdef",
+        "root_state": root,
+        "seed_chosen": True,
+        "committed_count": count,
+        "input_file": inputs or str(pathlib.Path(output).with_name("run.inputs.txt")),
+        "output_file": output,
+    }
+
+
 def _old_parallel_checkpoint(tmp_path, rows=2):
     """Logs shaped exactly like a clean run from before per-index seeding.
 
@@ -691,7 +704,7 @@ def test_a_checkpoint_from_the_old_parallel_scheme_is_refused(tmp_path):
 def test_a_checkpoint_this_release_wrote_is_accepted(tmp_path):
     """The same rows, with the manifest beside them, continue normally."""
     inputs, outputs = _old_parallel_checkpoint(tmp_path)
-    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+    mc._write_run_manifest(str(outputs), _generation(str(outputs), root=(42, (), 4, 0)))
 
     mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
 
@@ -699,7 +712,7 @@ def test_a_checkpoint_this_release_wrote_is_accepted(tmp_path):
 def test_a_manifest_from_another_scheme_is_refused(tmp_path):
     """A future or foreign scheme is named rather than guessed at."""
     inputs, outputs = _old_parallel_checkpoint(tmp_path)
-    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+    mc._write_run_manifest(str(outputs), _generation(str(outputs), root=(42, (), 4, 0)))
     path = mc._manifest_path(str(outputs))
     document = json.loads(path.read_text(encoding="utf-8"))
     document["sampling_scheme"] = "something-else-v9"
@@ -726,16 +739,19 @@ def test_the_lineage_outlives_the_object_that_wrote_it(tmp_path):
 
     first = object.__new__(MonteCarlo)
     first._output_file = output
+    first._input_file = str(pathlib.Path(output).with_name("run.inputs.txt"))
     first._MonteCarlo__capture_root_state(42)
-    first._MonteCarlo__commit_root_lineage()
+    first._MonteCarlo__start_a_generation("0123456789abcdef")
 
     second = object.__new__(MonteCarlo)  # nothing carried over in memory
     second._output_file = output
+    second._input_file = str(pathlib.Path(output).with_name("run.inputs.txt"))
     with pytest.raises(ValueError, match="different root"):
         second._MonteCarlo__capture_root_state(7, appending=True)
 
     third = object.__new__(MonteCarlo)
     third._output_file = output
+    third._input_file = str(pathlib.Path(output).with_name("run.inputs.txt"))
     third._MonteCarlo__capture_root_state(None, appending=True)
 
     assert third._MonteCarlo__root_fingerprint == first._MonteCarlo__root_fingerprint
@@ -921,7 +937,7 @@ def test_a_manifest_that_does_not_describe_a_root_is_refused(
     ``bool("false")`` is True, so a string there read as a chosen seed.
     """
     inputs, outputs = _old_parallel_checkpoint(tmp_path)
-    mc._write_run_manifest(str(outputs), (42, (), 4, 0), True)
+    mc._write_run_manifest(str(outputs), _generation(str(outputs), root=(42, (), 4, 0)))
     path = mc._manifest_path(str(outputs))
     document = json.loads(path.read_text(encoding="utf-8"))
     document.update(broken)
@@ -934,7 +950,7 @@ def test_a_manifest_that_does_not_describe_a_root_is_refused(
 def test_a_failed_manifest_write_leaves_the_previous_one(tmp_path, monkeypatch):
     """The manifest gates appends now, so a torn write cannot be left behind."""
     output = str(tmp_path / "run.outputs.txt")
-    mc._write_run_manifest(output, (42, (), 4, 0), True)
+    mc._write_run_manifest(output, _generation(output, root=(42, (), 4, 0)))
     before = mc._manifest_path(output).read_bytes()
 
     real_replace = os.replace
@@ -946,7 +962,66 @@ def test_a_failed_manifest_write_leaves_the_previous_one(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", fail)
     with pytest.warns(RuntimeWarning, match="run manifest"):
-        mc._write_run_manifest(output, (7, (), 4, 0), True)
+        mc._write_run_manifest(output, _generation(output, root=(7, (), 4, 0)))
 
     assert mc._manifest_path(output).read_bytes() == before
     assert not list(tmp_path.glob("*.partial"))
+
+
+def test_the_manifest_counts_the_rows_that_are_there(tmp_path):
+    """The count comes from the logs, not from the number asked for.
+
+    An interrupt before the first new row used to move the metadata without
+    moving the logs, and a target that was never reached claimed rows that do
+    not exist.
+    """
+    _, outputs = _old_parallel_checkpoint(tmp_path, rows=3)
+    analysis = object.__new__(MonteCarlo)
+    analysis._output_file = str(outputs)
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
+    analysis._MonteCarlo__generation = _generation(str(outputs), count=99)
+
+    analysis._MonteCarlo__record_what_was_committed()
+
+    recorded = mc._read_run_manifest(str(outputs))
+    assert recorded["committed_count"] == 3, "the target, not the rows, was recorded"
+
+
+def test_a_count_that_cannot_be_taken_leaves_the_previous_one(tmp_path):
+    """Bookkeeping after a finished run must not fail the run."""
+    output = str(tmp_path / "gone.outputs.txt")
+    analysis = object.__new__(MonteCarlo)
+    analysis._output_file = output
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
+    analysis._MonteCarlo__generation = _generation(output, count=7)
+
+    with pytest.warns(RuntimeWarning, match="committed count"):
+        analysis._MonteCarlo__record_what_was_committed()
+
+    assert mc._read_run_manifest(output)["committed_count"] == 7
+
+
+@pytest.mark.parametrize("missing", ["run_id", "committed_count"])
+def test_a_manifest_without_an_identity_is_refused(tmp_path, missing):
+    """A manifest has to say which run and how many rows it describes."""
+    inputs, outputs = _old_parallel_checkpoint(tmp_path)
+    mc._write_run_manifest(str(outputs), _generation(str(outputs), count=2))
+    path = mc._manifest_path(str(outputs))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document[missing]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=missing.replace("_", "[_ ]")):
+        mc._check_the_checkpoint_supports_appending(str(inputs), str(outputs), 2)
+
+
+def test_the_manifest_names_the_logs_it_was_written_for(tmp_path):
+    """Pairing one run's inputs with another's outputs has to be visible."""
+    _, outputs = _old_parallel_checkpoint(tmp_path)
+    mc._write_run_manifest(str(outputs), _generation(str(outputs), count=2))
+
+    recorded = mc._read_run_manifest(str(outputs))
+
+    assert recorded["output_log"] == "run.outputs.txt"
+    assert recorded["input_log"] == "run.inputs.txt"
+    assert recorded["run_id"]

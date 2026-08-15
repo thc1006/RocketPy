@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import traceback
+import uuid
 import warnings
 from contextlib import contextmanager
 from copy import deepcopy
@@ -207,6 +208,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
     # without __init__ still answers.
     __root_state = None
     __draws_before_this_simulation = ()
+    __generation = None
     __root_fingerprint = None
     __root_seed_given = False
 
@@ -431,19 +433,22 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         print("Starting Monte Carlo analysis")
 
         self.__setup_files(append)
-        if not append:
-            # Emptied just now, so whatever they held is gone and this root
-            # owns them even if the run below never reaches its first row.
-            self.__commit_root_lineage()
+        # Emptied just now for a fresh run, so a new generation starts here and
+        # this root owns the logs even if the run never reaches its first row.
+        # An append stays in the generation it is continuing.
+        self.__start_a_generation(
+            self.__generation["run_id"] if append else uuid.uuid4().hex
+        )
 
         if parallel:
             self.__run_in_parallel(n_workers)
         else:
             self.__run_in_serial()
 
-        if number_of_simulations > self._initial_sim_idx:
-            self.__commit_root_lineage()
         self.__check_each_index_was_recorded_once()
+        # After the check, and from the rows themselves: a target that was not
+        # reached must not be recorded as though it had been.
+        self.__record_what_was_committed()
         self.__terminate_simulation()
 
     def __setup_files(self, append):
@@ -572,14 +577,43 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f"requested {number_of_simulations}."
             )
 
-    def __commit_root_lineage(self):
-        """Record that the logs now hold rows derived from this run's root.
+    def __start_a_generation(self, run_id):
+        """Say which root the logs that were just emptied belong to.
 
-        Kept apart from capturing it, because the capture runs before anything
-        opens a file. A run that adds nothing, or dies before its first row,
-        must leave the manifest describing the root already in the logs.
+        Written here rather than at the end of the run: ``__setup_files`` has
+        already replaced them, so they belong to this root whether or not the
+        run reaches its first row. The count starts at zero and is corrected
+        once the rows on disk have been checked.
         """
-        _write_run_manifest(self.output_file, self.__root_state, self.__root_seed_given)
+        self.__generation = {
+            "run_id": run_id,
+            "root_state": self.__root_state,
+            "seed_chosen": self.__root_seed_given,
+            "committed_count": 0,
+            "input_file": self.input_file,
+            "output_file": self.output_file,
+        }
+        _write_run_manifest(self.output_file, self.__generation)
+
+    def __record_what_was_committed(self):
+        """Bring the manifest up to the rows that are actually on disk.
+
+        Counted from the logs after the completeness check rather than from the
+        number of simulations asked for: an interrupt before the first new row
+        would otherwise move the metadata without moving the logs, and a target
+        that was never reached would claim rows that do not exist.
+
+        Best effort, like the write itself. The run has finished and its rows
+        are on disk; a count that cannot be taken leaves the previous one,
+        which the next append then refuses on rather than trusts.
+        """
+
+        def count_them():
+            written, _ = _recorded_indices("outputs", self.output_file)
+            self.__generation["committed_count"] = len(written)
+
+        _best_effort(count_them, "committed count")
+        _write_run_manifest(self.output_file, self.__generation)
 
     def __child_seed(self, sim_idx):
         """Return the seed sequence for a single simulation index.
@@ -2211,21 +2245,25 @@ def _jsonable_entropy(entropy):
     return [int(part) for part in np.asarray(entropy).ravel()]
 
 
-def _write_run_manifest(output_file, root_state, seed_chosen):
-    """Record the scheme and the root the rows in this log came from.
+def _write_run_manifest(output_file, generation):
+    """Record which generation of logs these rows belong to.
 
-    Staged beside the manifest and moved onto it, because this is what decides
-    whether a later run may continue the checkpoint at all: a torn write would
-    leave a document that parses as absent or as another generation. Failing to
-    write it is still only a warning, since the alternative is losing a run that
+    Staged beside the manifest and moved onto it, because this decides whether a
+    later run may continue the checkpoint at all: a torn write would leave a
+    document that reads as absent or as another generation. Failing to write it
+    is still only a warning, since the alternative is losing a run that
     finished, and the next append refuses without it either way.
     """
-    entropy, spawn_key, pool_size, base = root_state
+    entropy, spawn_key, pool_size, base = generation["root_state"]
     document = {
         "schema_version": _MANIFEST_SCHEMA_VERSION,
         "sampling_scheme": _SAMPLING_SCHEME,
         "log_format": "jsonl-v1",
-        "seed_chosen": bool(seed_chosen),
+        "run_id": generation["run_id"],
+        "committed_count": int(generation["committed_count"]),
+        "input_log": Path(generation["input_file"]).name,
+        "output_log": Path(generation["output_file"]).name,
+        "seed_chosen": bool(generation["seed_chosen"]),
         "root_state": {
             "entropy": _jsonable_entropy(entropy),
             "spawn_key": [int(key) for key in spawn_key],
@@ -2296,6 +2334,10 @@ def _root_state_from_manifest(document, output_file):
         refuse(f"names log format {document.get('log_format')!r}, not 'jsonl-v1'")
     if not isinstance(document.get("seed_chosen"), bool):
         refuse("has a seed_chosen that is not true or false")
+    if not isinstance(document.get("run_id"), str) or not document["run_id"]:
+        refuse("carries no run_id")
+    if not _is_whole_number(document.get("committed_count")):
+        refuse("has a committed_count that is not a whole number")
     recorded = document.get("root_state")
     if not isinstance(recorded, dict):
         refuse("carries no root_state")

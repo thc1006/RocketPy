@@ -399,8 +399,9 @@ def test_appending_from_another_root_is_refused(
     """
     analysis = object.__new__(MonteCarlo)
     analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
     analysis._MonteCarlo__capture_root_state(first_seed)
-    analysis._MonteCarlo__commit_root_lineage()
+    analysis._MonteCarlo__start_a_generation("0123456789abcdef")
 
     if refused:
         with pytest.raises(ValueError, match="different root"):
@@ -413,8 +414,9 @@ def test_appending_without_a_seed_continues_the_recorded_root(tmp_path):
     """No random_seed on an append means continue, not start something new."""
     analysis = object.__new__(MonteCarlo)
     analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
     analysis._MonteCarlo__capture_root_state(42)
-    analysis._MonteCarlo__commit_root_lineage()
+    analysis._MonteCarlo__start_a_generation("0123456789abcdef")
     started_with = analysis._MonteCarlo__root_fingerprint
 
     analysis._MonteCarlo__capture_root_state(None, appending=True)
@@ -449,6 +451,7 @@ def test_a_first_run_has_no_recorded_root_to_continue(tmp_path):
     """With no manifest beside the log there is nothing to continue or refuse."""
     analysis = object.__new__(MonteCarlo)
     analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
 
     analysis._MonteCarlo__capture_root_state(42, appending=True)
 
@@ -484,6 +487,7 @@ def _simulate_without_flying(monkeypatch, analysis, tmp_path):
     # beside the output log, and fixed names put it in the repository root.
     analysis._input_file = str(tmp_path / "run.inputs.txt")
     analysis._output_file = str(tmp_path / "run.outputs.txt")
+    analysis._input_file = str(tmp_path / "run.inputs.txt")
     analysis._error_file = str(tmp_path / "run.errors.txt")
     for name in (
         "_MonteCarlo__setup_files",
