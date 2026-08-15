@@ -330,3 +330,39 @@ def test_the_snapshot_reaches_a_mutable_nested_in_a_tuple():
 
     assert copied[0][0, 1] == 0.0
     assert _snapshot_of((function, "degrees"))[0] is function
+
+
+def test_configuring_a_late_input_again_reads_the_nominal_again(calisto):
+    """``configured`` has to mean the second call as well as the first.
+
+    The kept nominal had no replacement path, so a second
+    ``add_cp_eccentricity`` went on sampling around the value the rocket held
+    at the first one. Reproducible, and around the wrong centre.
+    """
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+
+    calisto.cp_eccentricity_x = 0.5
+    stochastic.add_cp_eccentricity(x=0.001)
+    calisto.cp_eccentricity_x = 0.8
+    stochastic.add_cp_eccentricity(x=0.001)
+
+    assert stochastic.cp_eccentricity_x[0] == 0.8
+
+    stochastic._set_stochastic(11)
+
+    assert stochastic.cp_eccentricity_x[0] == 0.8
+
+
+def test_a_refused_reconfiguration_leaves_the_previous_one(calisto):
+    """Dropping the kept nominal before validation must not outlive a failure."""
+    calisto.cp_eccentricity_x = 0.5
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    stochastic.add_cp_eccentricity(x=0.001)
+
+    calisto.cp_eccentricity_x = 0.8
+    with pytest.raises(AssertionError):
+        stochastic.add_cp_eccentricity(x=object())
+
+    stochastic._set_stochastic(11)
+
+    assert stochastic.cp_eccentricity_x[0] == 0.5

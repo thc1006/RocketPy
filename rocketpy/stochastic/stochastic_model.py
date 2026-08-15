@@ -82,6 +82,9 @@ def _sampler_seed(seed, input_names):
     return sum(int(word) << (32 * position) for position, word in enumerate(words))
 
 
+_MISSING = object()
+
+
 # TODO: Stop using assert in production code. Use exceptions instead.
 # TODO: Each validation method should have a test case.
 
@@ -163,6 +166,24 @@ class StochasticModel:
                 getattr(self.obj, input_name)
             )
         return _snapshot_of(self.__nominal_values[input_name])
+
+    def _reconfigure_stochastic_input(self, input_name, input_value, validate):
+        """Configures a late input again, reading its nominal as it is now.
+
+        The kept nominal is what ``configured`` means, so replacing the input
+        has to drop it before validation reads one. A validation that raises
+        leaves the previous configuration standing.
+        """
+        kept = self.__nominal_values.pop(input_name, _MISSING)
+        try:
+            validated = validate()
+        except BaseException:
+            self.__nominal_values.pop(input_name, None)
+            if kept is not _MISSING:
+                self.__nominal_values[input_name] = kept
+            raise
+        self._declare_stochastic_input(input_name, input_value)
+        return validated
 
     def _declare_stochastic_input(self, input_name, input_value):
         """Declare an input that an ``add_*`` method installs after ``__init__``.
