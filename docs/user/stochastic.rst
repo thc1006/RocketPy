@@ -131,6 +131,14 @@ passed in a few different ways:
     sample, since what it returns replaces the outline instead of perturbing it.
 
 .. note::
+    Where the nominal value comes from the deterministic object, it is read when
+    the ``Stochastic`` object is built and kept from then on. Changing the
+    deterministic object afterwards does not move what is sampled around, and
+    neither does a ``MonteCarlo`` run: ``create_object`` writes each sampled
+    value back onto that object, so re-reading it would take one simulation's
+    output as the next one's nominal.
+
+.. note::
     In statistics, the terms "Normal" and "Gaussian" refer to the same type of \
     distribution. This distribution is commonly used and is the default for the \
     ``Stochastic`` classes in RocketPy.

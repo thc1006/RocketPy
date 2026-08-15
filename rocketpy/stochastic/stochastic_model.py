@@ -3,12 +3,28 @@ Defines the `StochasticModel` class, which is used as a base class for all other
 Stochastic classes.
 """
 
+from copy import deepcopy
+
 import numpy as np
 
 from rocketpy.mathutils.function import Function
 from rocketpy.stochastic.custom_sampler import CustomSampler
 
 from ..tools import get_distribution
+
+
+def _snapshot_of(value):
+    """A nominal that writing through the wrapped object cannot reach.
+
+    Containers are copied, since ``obj.shape_points[:] = ...`` would otherwise
+    move the value this is meant to hold still. Anything else is kept by
+    reference: nothing here mutates a ``Function`` or a motor in place.
+    """
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, (list, dict, set)):
+        return deepcopy(value)
+    return value
 
 
 def _names_as_spawn_key(input_names):
@@ -122,7 +138,25 @@ class StochasticModel:
         self.obj = obj
         self.last_rnd_dict = {}
         self.__stochastic_dict = kwargs
+        self.__nominal_values = {}
         self._set_stochastic(seed)
+
+    def _nominal(self, input_name, getter=getattr):
+        """``self.obj``'s value for ``input_name`` as it was when built.
+
+        Kept because ``create_object`` writes the sampled value back onto
+        ``self.obj``, so re-reading it on a reseed takes one simulation's output
+        as the next one's nominal. An injected ``getter`` reads a component's
+        own attribute, which nothing writes back to, and every component's
+        position arrives under the one name, so those are not cached.
+        """
+        if getter is not getattr:
+            return getter(self.obj, input_name)
+        if input_name not in self.__nominal_values:
+            self.__nominal_values[input_name] = _snapshot_of(
+                getattr(self.obj, input_name)
+            )
+        return self.__nominal_values[input_name]
 
     def _declare_stochastic_input(self, input_name, input_value):
         """Declare an input that an ``add_*`` method installs after ``__init__``.
@@ -186,7 +220,7 @@ class StochasticModel:
                                 "or a custom sampler"
                             )
                 else:
-                    attr_value = [getattr(self.obj, input_name)]
+                    attr_value = [self._nominal(input_name)]
                 setattr(self, input_name, attr_value)
 
     def __repr__(self):
@@ -321,7 +355,7 @@ class StochasticModel:
             # object passed.
             dist_func = get_distribution(input_value[1], self.__random_number_generator)
             return (
-                self._nominal_value(input_name, getattr(self.obj, input_name)),
+                self._nominal_value(input_name, self._nominal(input_name, getattr)),
                 input_value[0],
                 dist_func,
             )
@@ -397,7 +431,7 @@ class StochasticModel:
             If the input is not in a valid format.
         """
         if not input_value:
-            return [getattr(self.obj, input_name)]
+            return [self._nominal(input_name, getattr)]
         else:
             return input_value
 
@@ -423,7 +457,7 @@ class StochasticModel:
                 distribution function).
         """
         return (
-            self._nominal_value(input_name, getattr(self.obj, input_name)),
+            self._nominal_value(input_name, self._nominal(input_name, getattr)),
             input_value,
             get_distribution("normal", self.__random_number_generator),
         )
@@ -450,7 +484,7 @@ class StochasticModel:
             If the input is not in a valid format.
         """
         attribute_name = input_name.replace("_factor", "")
-        setattr(self, f"_{attribute_name}", getattr(self.obj, attribute_name))
+        setattr(self, f"_{attribute_name}", self._nominal(attribute_name))
 
         if isinstance(input_value, tuple):
             return self._validate_tuple_factor(input_name, input_value)
