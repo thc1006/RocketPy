@@ -3,6 +3,7 @@ import pytest
 
 from rocketpy import Environment
 from rocketpy.mathutils.function import Function
+from rocketpy.rocket.aero_surface import FreeFormFins
 from rocketpy.stochastic import StochasticEnvironment, StochasticFreeFormFins
 from rocketpy.stochastic.stochastic_model import _snapshot_of
 
@@ -170,8 +171,69 @@ def test_a_mutable_nominal_survives_a_write_through_the_object(
     assert np.array_equal(stochastic.shape_points[0], expected)
 
 
+def test_a_generated_object_cannot_move_the_kept_nominal(calisto_free_form_fins):
+    """The kept value has to stay private, not only be copied on the way in.
+
+    An empty spec keeps the object's own outline, and that one object reached
+    the model attribute, ``last_rnd_dict`` and the fins ``create_object``
+    returns, so a write through any of them moved the next reseed.
+    """
+    expected = [tuple(point) for point in calisto_free_form_fins.shape_points]
+    stochastic = StochasticFreeFormFins(
+        free_form_fins=calisto_free_form_fins, shape_points=None
+    )
+
+    generated = stochastic.create_object()
+    generated.shape_points[1] = (9.9, 9.9)
+    stochastic._set_stochastic(7)
+
+    assert [tuple(point) for point in stochastic.shape_points[0]] == expected
+
+
+def test_writing_through_the_model_attribute_cannot_move_it_either():
+    """The same, from the other public surface.
+
+    ``numpy.asarray(value, dtype=float)`` hands back what it was given when that
+    is already a float array, so the fin is built from one here.
+    """
+    fins = FreeFormFins(
+        n=4,
+        shape_points=np.array(
+            [(0, 0), (0.08, 0.1), (0.12, 0.1), (0.12, 0)], dtype=float
+        ),
+        rocket_radius=0.0635,
+    )
+    stochastic = StochasticFreeFormFins(free_form_fins=fins, shape_points=0.001)
+    stochastic._set_stochastic(7)
+    expected = np.array(stochastic.shape_points[0], copy=True)
+
+    stochastic.shape_points[0][1] = (9.9, 9.9)
+    stochastic._set_stochastic(7)
+
+    assert np.array_equal(stochastic.shape_points[0], expected)
+
+
+def test_a_spread_and_distribution_tuple_does_not_drift(example_plain_env):
+    """The ``(std, "distribution")`` form takes its centre from the object too.
+
+    The scalar test above goes through ``_validate_scalar`` and this through
+    ``_validate_tuple_length_two``, so one says nothing about the other.
+    """
+    example_plain_env.elevation = 100.0
+    stochastic = StochasticEnvironment(
+        environment=example_plain_env, elevation=(5.0, "normal")
+    )
+
+    elevations = []
+    for _ in range(4):
+        stochastic._set_stochastic(2024)
+        elevations.append(float(stochastic.create_object().elevation))
+
+    assert len(set(elevations)) == 1, f"the centre drifted: {elevations}"
+
+
 def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
-    """Only containers are copied, so the rule can be stated as it behaves."""
+    """Only built-in containers are copied, so the rule behaves as stated."""
     array = np.array([1.0, 2.0])
     listed = [[1.0], [2.0]]
     function = Function(lambda x: x)
@@ -180,4 +242,40 @@ def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
     assert _snapshot_of(listed) is not listed
     assert _snapshot_of(listed)[0] is not listed[0]  # deep, not shallow
     assert _snapshot_of(function) is function
+    assert _snapshot_of({"a": [1.0]})["a"] is not None
     assert _snapshot_of(3.0) == 3.0
+
+
+def test_two_components_do_not_share_one_position_nominal(stochastic_calisto):
+    """Component positions are read live, through an injected getter.
+
+    Every one of them arrives under the name ``position``, so keeping them the
+    way the other inputs are kept would hand the second component the first
+    one's place. The report test notices the getter going missing, but only
+    because reading ``position`` off the rocket raises; it would not notice a
+    key that quietly collides.
+    """
+    stochastic_calisto._set_stochastic(5)
+
+    places = {}
+    for component, position in stochastic_calisto.aerodynamic_surfaces:
+        nominal = position[0]
+        places[type(component).__name__] = float(getattr(nominal, "z", nominal))
+
+    assert len(places) > 1, "need more than one surface for this to say anything"
+    assert len(set(places.values())) == len(places), places
+
+
+def test_the_snapshot_reaches_a_mutable_nested_in_a_tuple():
+    """An ``airfoil`` is ``(source, unit)`` and the source may be an array, so
+    stopping at the tuple would leave that array shared with the object it came
+    from. A ``Function`` nested the same way still travels by reference.
+    """
+    source = np.array([[0.0, 0.0], [1.0, 1.0]])
+    function = Function(lambda x: x)
+
+    copied = _snapshot_of((source, "degrees"))
+    source[0, 1] = 99.0
+
+    assert copied[0][0, 1] == 0.0
+    assert _snapshot_of((function, "degrees"))[0] is function

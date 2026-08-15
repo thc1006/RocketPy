@@ -132,11 +132,26 @@ passed in a few different ways:
 
 .. note::
     Where the nominal value comes from the deterministic object, it is read when
-    the ``Stochastic`` object is built and kept from then on. Changing the
-    deterministic object afterwards does not move what is sampled around, and
-    neither does a ``MonteCarlo`` run: ``create_object`` writes each sampled
-    value back onto that object, so re-reading it would take one simulation's
-    output as the next one's nominal.
+    that input is configured and kept from then on, so changing the deterministic
+    object afterwards does not move what is sampled around. Neither does a
+    ``MonteCarlo`` run: ``create_object`` writes each sampled value back onto
+    that object, and re-reading it would take one simulation's output as the
+    next one's nominal. Arrays and the built-in containers are copied on the way
+    in and on the way out, so writing through a generated object does not reach
+    the kept value either.
+
+    Four things sit outside that rule on purpose:
+
+    - an input installed by an ``add_*`` method, an eccentricity for instance, is
+      read when it is added rather than when the object is built;
+    - a component's position is read from its own component on every reset, since
+      each of them arrives under the one name ``position``;
+    - an ensemble wind factor scales the selected member's own profile, because
+      ``select_ensemble_member`` rebuilds the wind and the value from before it
+      belongs to whichever member was loaded then;
+    - anything that is not an array or a built-in container, a ``Function`` or a
+      callable among them, is kept by reference and follows the object it came
+      from.
 
 .. note::
     In statistics, the terms "Normal" and "Gaussian" refer to the same type of \

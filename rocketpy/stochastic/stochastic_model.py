@@ -3,8 +3,6 @@ Defines the `StochasticModel` class, which is used as a base class for all other
 Stochastic classes.
 """
 
-from copy import deepcopy
-
 import numpy as np
 
 from rocketpy.mathutils.function import Function
@@ -14,16 +12,24 @@ from ..tools import get_distribution
 
 
 def _snapshot_of(value):
-    """A nominal that writing through the wrapped object cannot reach.
+    """Returns a copy of value that a later write cannot reach.
 
-    Containers are copied, since ``obj.shape_points[:] = ...`` would otherwise
-    move the value this is meant to hold still. Anything else is kept by
-    reference: nothing here mutates a ``Function`` or a motor in place.
+    Arrays and the built-in containers are copied entry by entry, since an array
+    inside an ``airfoil`` tuple would otherwise stay shared. Anything else is
+    returned as it is.
     """
     if isinstance(value, np.ndarray):
         return value.copy()
-    if isinstance(value, (list, dict, set)):
-        return deepcopy(value)
+    if isinstance(value, list):
+        return [_snapshot_of(item) for item in value]
+    if isinstance(value, tuple):
+        entries = [_snapshot_of(item) for item in value]
+        # A namedtuple takes its fields positionally.
+        return type(value)(*entries) if hasattr(value, "_fields") else tuple(entries)
+    if isinstance(value, set):
+        return {_snapshot_of(item) for item in value}
+    if isinstance(value, dict):
+        return {key: _snapshot_of(item) for key, item in value.items()}
     return value
 
 
@@ -142,13 +148,13 @@ class StochasticModel:
         self._set_stochastic(seed)
 
     def _nominal(self, input_name, getter=getattr):
-        """``self.obj``'s value for ``input_name`` as it was when built.
+        """Returns what ``self.obj`` held for ``input_name`` when it was
+        configured.
 
-        Kept because ``create_object`` writes the sampled value back onto
-        ``self.obj``, so re-reading it on a reseed takes one simulation's output
-        as the next one's nominal. An injected ``getter`` reads a component's
-        own attribute, which nothing writes back to, and every component's
-        position arrives under the one name, so those are not cached.
+        Kept and copied both ways, because ``create_object`` writes sampled
+        values back onto that object and what this returns reaches
+        ``last_rnd_dict``. A position arrives through a ``getter`` and is read
+        live, since every component uses this one name.
         """
         if getter is not getattr:
             return getter(self.obj, input_name)
@@ -156,7 +162,7 @@ class StochasticModel:
             self.__nominal_values[input_name] = _snapshot_of(
                 getattr(self.obj, input_name)
             )
-        return self.__nominal_values[input_name]
+        return _snapshot_of(self.__nominal_values[input_name])
 
     def _declare_stochastic_input(self, input_name, input_value):
         """Declare an input that an ``add_*`` method installs after ``__init__``.
