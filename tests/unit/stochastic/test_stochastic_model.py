@@ -405,3 +405,27 @@ def test_a_half_that_was_never_given_is_not_declared(calisto):
 
     assert "cp_eccentricity_x" in generated
     assert "cp_eccentricity_y" not in generated
+
+
+def test_a_pair_of_late_inputs_is_replaced_together(calisto):
+    """``add_cp_eccentricity`` takes x and y in one call, so a y that will not
+    validate must leave x exactly as it was, declaration included.
+
+    Only y is given first, so x is undeclared going in and a partial commit
+    shows up as an eccentricity the caller never successfully asked for.
+    """
+    calisto.cp_eccentricity_x = 0.5
+    calisto.cp_eccentricity_y = 0.6
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    stochastic.add_cp_eccentricity(y=0.002)
+
+    calisto.cp_eccentricity_x = 0.8
+    with pytest.raises(AssertionError):
+        stochastic.add_cp_eccentricity(x=0.001, y=object())
+
+    stochastic._set_stochastic(11)
+    generated = next(stochastic.dict_generator())
+
+    assert "cp_eccentricity_x" not in generated
+    assert generated["cp_eccentricity_y"] is not None
+    assert stochastic.cp_eccentricity_y[0] == 0.6

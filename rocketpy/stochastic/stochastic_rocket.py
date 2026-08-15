@@ -456,15 +456,11 @@ class StochasticRocket(StochasticModel):
         self : StochasticRocket
             Object of the StochasticRocket class.
         """
-        self.cp_eccentricity_x = self._reconfigure_stochastic_input(
-            "cp_eccentricity_x",
-            x,
-            lambda: self._validate_eccentricity("cp_eccentricity_x", x),
-        )
-        self.cp_eccentricity_y = self._reconfigure_stochastic_input(
-            "cp_eccentricity_y",
-            y,
-            lambda: self._validate_eccentricity("cp_eccentricity_y", y),
+        self.cp_eccentricity_x, self.cp_eccentricity_y = (
+            self._reconfigure_stochastic_inputs(
+                (("cp_eccentricity_x", x), ("cp_eccentricity_y", y)),
+                self._validate_eccentricity,
+            )
         )
         return self
 
@@ -490,15 +486,11 @@ class StochasticRocket(StochasticModel):
         self : StochasticRocket
             Object of the StochasticRocket class.
         """
-        self.thrust_eccentricity_x = self._reconfigure_stochastic_input(
-            "thrust_eccentricity_x",
-            x,
-            lambda: self._validate_eccentricity("thrust_eccentricity_x", x),
-        )
-        self.thrust_eccentricity_y = self._reconfigure_stochastic_input(
-            "thrust_eccentricity_y",
-            y,
-            lambda: self._validate_eccentricity("thrust_eccentricity_y", y),
+        self.thrust_eccentricity_x, self.thrust_eccentricity_y = (
+            self._reconfigure_stochastic_inputs(
+                (("thrust_eccentricity_x", x), ("thrust_eccentricity_y", y)),
+                self._validate_eccentricity,
+            )
         )
         return self
 

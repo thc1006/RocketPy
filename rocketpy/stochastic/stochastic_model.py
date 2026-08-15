@@ -168,26 +168,32 @@ class StochasticModel:
             )
         return _snapshot_of(self.__nominal_values[input_name])
 
-    def _reconfigure_stochastic_input(self, input_name, input_value, validate):
-        """Configures a late input again, reading its nominal as it is now.
+    def _reconfigure_stochastic_inputs(self, inputs, validate):
+        """Configures late inputs again, all of them or none of them.
 
-        The kept nominal is what ``configured`` means, so replacing the input
-        has to drop it before validation reads one. A validation that raises
-        leaves the previous configuration standing, and ``None`` takes away
-        whatever was declared before rather than leaving it to be drawn again.
+        The kept nominal is what ``configured`` means, so replacing an input
+        has to drop it before validation reads one. Whatever a caller passes
+        together is replaced together, since ``add_cp_eccentricity`` takes x
+        and y in one call and a y that will not validate must not leave x
+        already replaced. ``None`` takes away what was declared before.
         """
-        kept = self.__nominal_values.pop(input_name, _MISSING)
+        kept = {
+            name: self.__nominal_values.pop(name)
+            for name, _ in inputs
+            if name in self.__nominal_values
+        }
         try:
-            validated = validate()
+            validated = [validate(name, value) for name, value in inputs]
         except BaseException:
-            self.__nominal_values.pop(input_name, None)
-            if kept is not _MISSING:
-                self.__nominal_values[input_name] = kept
+            for name, _ in inputs:
+                self.__nominal_values.pop(name, None)
+            self.__nominal_values.update(kept)
             raise
-        if input_value is None:
-            self.__stochastic_dict.pop(input_name, None)
-        else:
-            self.__stochastic_dict[input_name] = input_value
+        for name, value in inputs:
+            if value is None:
+                self.__stochastic_dict.pop(name, None)
+            else:
+                self.__stochastic_dict[name] = value
         return validated
 
     def _declare_stochastic_input(self, input_name, input_value):
