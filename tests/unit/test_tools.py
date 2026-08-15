@@ -5,6 +5,7 @@ import pytest
 
 from rocketpy import Environment
 from rocketpy.tools import (
+    _seed_sequence_to_int,
     calculate_confidence_ellipse,
     calculate_cubic_hermite_coefficients,
     convert_local_extent_to_wgs84,
@@ -347,3 +348,23 @@ def test_mercator_extent_to_local_preserves_offset_sign(
     assert local_extent[0] < local_extent[1]
     assert local_extent[2] < local_extent[3]
     assert all(expected_sign * value > 0 for value in local_extent)
+
+
+def test_seed_sequence_to_int_keeps_the_full_width():
+    """All four words have to reach the seed.
+
+    Taking only the first one would still hand every component a different
+    number, so every seeding test would pass over a 32-bit collapse that puts
+    two streams back together near 2**16 of them.
+    """
+    root = np.random.SeedSequence(12345)
+    a, b = root.spawn(2)
+    low = int(a.generate_state(4, dtype=np.uint32)[0])
+
+    seed = _seed_sequence_to_int(a)
+
+    assert seed >> 32, "everything above the first word was dropped"
+    assert seed & 0xFFFFFFFF == low
+    assert seed.bit_length() <= 128
+    assert seed != _seed_sequence_to_int(b)
+    assert seed == _seed_sequence_to_int(a), "reading it twice moved the seed"

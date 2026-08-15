@@ -2,6 +2,8 @@
 
 import warnings
 
+import numpy as np
+
 from rocketpy.control import _Controller
 from rocketpy.mathutils.vector_matrix import Vector
 from rocketpy.motors.empty_motor import EmptyMotor
@@ -21,6 +23,7 @@ from rocketpy.rocket.parachute import Parachute
 from rocketpy.rocket.rocket import Rocket
 from rocketpy.stochastic.stochastic_generic_motor import StochasticGenericMotor
 from rocketpy.stochastic.stochastic_motor_model import StochasticMotorModel
+from rocketpy.tools import _seed_sequence_to_int
 
 from .stochastic_aero_surfaces import (
     StochasticAirBrakes,
@@ -173,25 +176,41 @@ class StochasticRocket(StochasticModel):
             coordinate_system_orientation=None,
         )
 
+    # Every collection of nested stochastic objects, in the order their child
+    # seeds are spawned. Named here rather than written out inline so a
+    # component type cannot reach create_object without reaching the reseed,
+    # which is how the air brakes were missed.
+    _POSITIONED_COLLECTIONS = ("aerodynamic_surfaces", "motors", "rail_buttons")
+    _PLAIN_COLLECTIONS = ("parachutes", "air_brakes")
+
+    @classmethod
+    def _stochastic_collections(cls):
+        """The names of every attribute holding nested stochastic objects."""
+        return cls._POSITIONED_COLLECTIONS + cls._PLAIN_COLLECTIONS
+
     def _set_stochastic(self, seed=None):
         """Set the stochastic attributes for Components, positions and
         inputs.
+
+        The rocket body and each nested component are reseeded from their own
+        child of a ``SeedSequence`` root, so two that sample the same
+        distribution stop drawing the same values. Children are spawned in a
+        fixed order, so one seed still reproduces the whole rocket.
 
         Parameters
         ----------
         seed : int, optional
             Seed for the random number generator.
         """
-        super()._set_stochastic(seed)
-        self.aerodynamic_surfaces = self.__reset_components(
-            self.aerodynamic_surfaces, seed
-        )
-        self.motors = self.__reset_components(self.motors, seed)
-        self.rail_buttons = self.__reset_components(self.rail_buttons, seed)
-        for parachute in self.parachutes:
-            parachute._set_stochastic(seed)
+        root = np.random.SeedSequence(seed)
+        super()._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
+        for name in self._POSITIONED_COLLECTIONS:
+            setattr(self, name, self.__reset_components(getattr(self, name), root))
+        for name in self._PLAIN_COLLECTIONS:
+            for component in getattr(self, name):
+                component._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
 
-    def __reset_components(self, components, seed):
+    def __reset_components(self, components, root):
         """Creates a new Components whose stochastic structures
         and their positions are reset.
 
@@ -200,8 +219,9 @@ class StochasticRocket(StochasticModel):
         components : Components
             The components which contains the stochastic structure that
             will be used to create the new components.
-        seed : int, optional
-            Seed for the random number generator.
+        root : numpy.random.SeedSequence
+            The reseed's root. Each component takes its own spawned child, so
+            components sampling the same distribution stay independent.
 
         Returns
         -------
@@ -213,7 +233,7 @@ class StochasticRocket(StochasticModel):
         new_components = Components()
         for stochastic_obj, _ in components:
             stochastic_obj_position_info = self.__components_map[stochastic_obj]
-            stochastic_obj._set_stochastic(seed)
+            stochastic_obj._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
             new_components.add(
                 stochastic_obj,
                 self._validate_position(stochastic_obj, stochastic_obj_position_info),

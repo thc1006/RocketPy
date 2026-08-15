@@ -1467,6 +1467,20 @@ def find_obj_from_hash(obj, hash_, depth_limit=None):
     return None
 
 
+def _seed_sequence_to_int(seed_sequence):
+    """Collapse a ``SeedSequence`` into a 128-bit Python ``int``.
+
+    An ``int`` is what ``numpy.random.default_rng`` and the stdlib
+    ``random.Random`` both take, while ``random.Random`` rejects a
+    ``SeedSequence`` since Python 3.11, so a custom sampler whose ``reset_seed``
+    documents an ``int`` keeps working. All four words are combined by value,
+    which keeps the full 128-bit pool and gives the same seed on either byte
+    order.
+    """
+    words = seed_sequence.generate_state(4, dtype=np.uint32)
+    return sum(int(word) << (32 * position) for position, word in enumerate(words))
+
+
 if __name__ == "__main__":  # pragma: no cover
     import doctest
 
