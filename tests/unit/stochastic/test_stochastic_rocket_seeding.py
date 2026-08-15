@@ -102,10 +102,12 @@ def test_the_reseed_covers_every_collection_create_object_uses(stochastic_calist
     declared = set(type(rocket)._stochastic_collections())
 
     assert iterated, "found no collections in create_object, so the scan is broken"
-    assert iterated <= declared, (
-        f"create_object samples these but the reseed never reaches them: "
-        f"{sorted(iterated - declared)}"
-    )
+    # Both directions. One left in the reseed after create_object stopped using
+    # it still spawns a child and moves every stream that follows.
+    assert iterated == declared, {
+        "sampled but never reseeded": sorted(iterated - declared),
+        "reseeded but never sampled": sorted(declared - iterated),
+    }
 
 
 def test_an_air_brake_answers_to_the_seed(
@@ -137,3 +139,23 @@ def test_an_air_brake_answers_to_the_seed(
 
     assert drawn(1234) == first, "the same seed drew a different air brake"
     assert drawn(1235) != first, "a different seed drew the same air brake"
+
+
+def test_adding_a_surface_leaves_the_other_collections_alone(
+    stochastic_calisto, calisto_main_chute, stochastic_nose_cone
+):
+    """Each collection has a root of its own, so an unrelated component in one
+    of them does not move the streams in the others."""
+    stochastic_calisto.parachutes = []
+    stochastic_calisto.add_parachute(
+        StochasticParachute(parachute=calisto_main_chute, cd_s=0.1, lag=0.2)
+    )
+
+    def parachute_draw():
+        stochastic_calisto._set_stochastic(5)
+        return _drawn(stochastic_calisto.parachutes[0])
+
+    before = parachute_draw()
+    stochastic_calisto.add_nose(stochastic_nose_cone, position=1.1)
+
+    assert parachute_draw() == before

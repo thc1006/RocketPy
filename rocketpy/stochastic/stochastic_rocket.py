@@ -189,22 +189,28 @@ class StochasticRocket(StochasticModel):
         """Set the stochastic attributes for Components, positions and
         inputs.
 
-        Each component takes its own child of a ``SeedSequence`` root, spawned
-        in a fixed order, so components stay independent and one seed still
-        reproduces the rocket.
+        Each component takes its own child of its collection's root, so
+        components stay independent and one seed still reproduces the rocket.
+        The body keeps the seed as given, and a collection has a root of its
+        own, so adding a fin does not move every parachute.
 
         Parameters
         ----------
         seed : int, optional
             Seed for the random number generator.
         """
-        root = np.random.SeedSequence(seed)
-        super()._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
+        super()._set_stochastic(seed)
+        names = self._stochastic_collections()
+        roots = dict(zip(names, np.random.SeedSequence(seed).spawn(len(names))))
         for name in self._POSITIONED_COLLECTIONS:
-            setattr(self, name, self.__reset_components(getattr(self, name), root))
+            setattr(
+                self, name, self.__reset_components(getattr(self, name), roots[name])
+            )
         for name in self._PLAIN_COLLECTIONS:
             for component in getattr(self, name):
-                component._set_stochastic(_seed_sequence_to_int(root.spawn(1)[0]))
+                component._set_stochastic(
+                    _seed_sequence_to_int(roots[name].spawn(1)[0])
+                )
 
     def __reset_components(self, components, root):
         """Creates a new Components whose stochastic structures
