@@ -135,7 +135,7 @@ def test_a_scalar_nominal_does_not_drift_across_reseeds():
     assert len(set(elevations)) == 1, f"the nominal elevation drifted: {elevations}"
 
 
-def test_the_nominal_is_the_one_the_model_was_built_with(example_plain_env):
+def test_the_nominal_is_the_one_the_input_was_configured_with(example_plain_env):
     """Snapshot semantics, stated once and pinned here.
 
     A model samples around what the wrapped object held when it was built, so a
@@ -267,11 +267,17 @@ def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
     listed = [[1.0], [2.0]]
     function = Function(lambda x: x)
 
+    mapped = {"a": [1.0]}
+    grouped = {("a", 1), ("b", 2)}
+
     assert _snapshot_of(array) is not array
     assert _snapshot_of(listed) is not listed
     assert _snapshot_of(listed)[0] is not listed[0]  # deep, not shallow
+    assert _snapshot_of(mapped) is not mapped
+    assert _snapshot_of(mapped)["a"] is not mapped["a"]
+    assert _snapshot_of(grouped) is not grouped
+    assert _snapshot_of(grouped) == grouped
     assert _snapshot_of(function) is function
-    assert _snapshot_of({"a": [1.0]})["a"] is not None
     assert _snapshot_of(3.0) == 3.0
 
 
@@ -366,3 +372,36 @@ def test_a_refused_reconfiguration_leaves_the_previous_one(calisto):
     stochastic._set_stochastic(11)
 
     assert stochastic.cp_eccentricity_x[0] == 0.5
+
+
+def test_taking_a_late_input_away_removes_what_it_declared(calisto):
+    """``None`` is a configuration too, and it has to survive a reseed.
+
+    The nominal was refreshed but the earlier distribution stayed declared, so
+    the next ``_set_stochastic`` validated it again and drew an uncertainty the
+    caller had asked to remove.
+    """
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    stochastic.add_cp_eccentricity(x=0.001)
+
+    calisto.cp_eccentricity_x = 0.8
+    stochastic.add_cp_eccentricity(x=None)
+    stochastic._set_stochastic(11)
+
+    assert "cp_eccentricity_x" not in next(stochastic.dict_generator())
+    assert stochastic.cp_eccentricity_x == [0.8]
+
+
+def test_a_half_that_was_never_given_is_not_declared(calisto):
+    """The control for the one above.
+
+    ``None`` also means an axis the caller never mentioned, and removing what
+    was never there has to stay a no-op rather than an error.
+    """
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    stochastic.add_cp_eccentricity(x=0.001)
+
+    generated = next(stochastic.dict_generator())
+
+    assert "cp_eccentricity_x" in generated
+    assert "cp_eccentricity_y" not in generated

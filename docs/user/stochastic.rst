@@ -134,11 +134,12 @@ passed in a few different ways:
     Where the nominal value comes from the deterministic object, it is read when
     that input is configured and kept from then on, so changing the deterministic
     object afterwards does not move what is sampled around. Neither does a
-    ``MonteCarlo`` run: ``create_object`` writes each sampled value back onto
-    that object, and re-reading it would take one simulation's output as the
-    next one's nominal. Arrays and the built-in containers are copied on the way
-    in and on the way out, so writing through a generated object does not reach
-    the kept value either.
+    ``MonteCarlo`` run: some ``create_object`` paths write the sampled value
+    back onto the object they were given rather than building a copy, and
+    re-reading it would take one simulation's output as the next one's nominal.
+    Arrays and the built-in containers are copied on the way in and on the way
+    out, so writing through a generated object does not reach the kept value
+    either.
 
     Four things sit outside that rule on purpose:
 

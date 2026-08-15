@@ -173,7 +173,8 @@ class StochasticModel:
 
         The kept nominal is what ``configured`` means, so replacing the input
         has to drop it before validation reads one. A validation that raises
-        leaves the previous configuration standing.
+        leaves the previous configuration standing, and ``None`` takes away
+        whatever was declared before rather than leaving it to be drawn again.
         """
         kept = self.__nominal_values.pop(input_name, _MISSING)
         try:
@@ -183,7 +184,10 @@ class StochasticModel:
             if kept is not _MISSING:
                 self.__nominal_values[input_name] = kept
             raise
-        self._declare_stochastic_input(input_name, input_value)
+        if input_value is None:
+            self.__stochastic_dict.pop(input_name, None)
+        else:
+            self.__stochastic_dict[input_name] = input_value
         return validated
 
     def _declare_stochastic_input(self, input_name, input_value):
