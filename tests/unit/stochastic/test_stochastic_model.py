@@ -275,6 +275,28 @@ def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
     assert _snapshot_of(3.0) == 3.0
 
 
+def test_a_function_nominal_is_held_as_it_was_given(calisto):
+    """The documented exception, pinned rather than only written down.
+
+    A ``Function`` is mutable through its own API, so ``set_source`` on the
+    rocket's drag curve does move the baseline. Copying it would mean
+    ``deepcopy`` of whatever a user passed, on a path that runs on every reseed
+    and today cannot fail, which is not a trade this change should make.
+    """
+    stochastic = StochasticRocket(
+        rocket=calisto, radius=0.0127 / 2, power_off_drag_factor=(1.0, 0.1)
+    )
+    stochastic._set_stochastic(4242)
+    before = float(stochastic.create_object().power_off_drag(0.5))
+
+    calisto.power_off_drag.set_source(lambda mach: 0.9)
+    stochastic._set_stochastic(4242)
+    after = float(stochastic.create_object().power_off_drag(0.5))
+
+    assert 0.3 < before < 0.5, before
+    assert 0.7 < after < 1.1, after
+
+
 def test_two_components_do_not_share_one_position_nominal(stochastic_calisto):
     """Component positions are read live, through an injected getter.
 
