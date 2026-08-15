@@ -14,9 +14,10 @@ from ..tools import get_distribution
 def _snapshot_of(value):
     """Returns a copy of value that a later write cannot reach.
 
-    Arrays and the built-in containers are copied entry by entry, since an array
-    inside an ``airfoil`` tuple would otherwise stay shared. Anything else is
-    returned as it is.
+    Numeric arrays and the built-in containers are copied entry by entry, since
+    an array inside an ``airfoil`` tuple would otherwise stay shared. This is
+    not a general deep copy: anything else is returned as it is, shared
+    structure is not rebuilt, and a cycle recurses until Python stops it.
     """
     if isinstance(value, np.ndarray):
         return value.copy()
