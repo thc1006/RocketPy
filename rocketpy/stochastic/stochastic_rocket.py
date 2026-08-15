@@ -734,10 +734,16 @@ class StochasticRocket(StochasticModel):
         return parachute
 
     def _create_eccentricities(self, stochastic_x, stochastic_y, eccentricity):
-        x_rnd = self._randomize_position(stochastic_x)
-        self.last_rnd_dict[eccentricity + "_x"] = x_rnd
-        y_rnd = self._randomize_position(stochastic_y)
-        self.last_rnd_dict[eccentricity + "_y"] = y_rnd
+        # A half that was given is a declared input, so dict_generator has drawn
+        # it already; drawing again would spend a second value out of the same
+        # stream and move every component position that follows.
+        def drawn_once(name, stochastic):
+            if name not in self.last_rnd_dict:
+                self.last_rnd_dict[name] = self._randomize_position(stochastic)
+            return self.last_rnd_dict[name]
+
+        x_rnd = drawn_once(eccentricity + "_x", stochastic_x)
+        y_rnd = drawn_once(eccentricity + "_y", stochastic_y)
         return x_rnd, y_rnd
 
     def create_object(self):
