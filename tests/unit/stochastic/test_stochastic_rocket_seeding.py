@@ -164,7 +164,9 @@ def test_adding_a_surface_leaves_the_other_collections_alone(
         return _drawn(stochastic_calisto.parachutes[0])
 
     before = parachute_draw()
-    stochastic_calisto.add_nose(stochastic_nose_cone, position=1.1)
+    # The deterministic nose, so add_nose builds a wrapper of its own. Adding
+    # the fixture again would store one wrapper twice, which is #1172.
+    stochastic_calisto.add_nose(stochastic_nose_cone.obj, position=1.1)
 
     assert parachute_draw() == before
 
@@ -235,3 +237,15 @@ def test_two_air_brakes_with_one_spec_stay_independent(
     assert first[0] != first[1], "two air brakes drew the same value"
     assert drawn(808) == first
     assert drawn(809) != first
+
+
+def test_the_rocket_body_keeps_the_seed_as_given(monkeypatch, stochastic_calisto):
+    """Fixing the nested components did not need the body's stream to move.
+
+    Reproducibility and seed uniqueness both hold with the body on a spawned
+    child, so neither of them would notice it going back there and taking every
+    fixed-seed mass and radius baseline with it.
+    """
+    seeds = _seeds_handed_out(monkeypatch, stochastic_calisto, 42)
+
+    assert seeds[0] == 42
