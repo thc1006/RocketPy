@@ -176,10 +176,7 @@ class StochasticRocket(StochasticModel):
             coordinate_system_orientation=None,
         )
 
-    # Every collection of nested stochastic objects, in the order their child
-    # seeds are spawned. Named here rather than written out inline so a
-    # component type cannot reach create_object without reaching the reseed,
-    # which is how the air brakes were missed.
+    # Nested stochastic objects, in spawn order
     _POSITIONED_COLLECTIONS = ("aerodynamic_surfaces", "motors", "rail_buttons")
     _PLAIN_COLLECTIONS = ("parachutes", "air_brakes")
 
@@ -192,10 +189,9 @@ class StochasticRocket(StochasticModel):
         """Set the stochastic attributes for Components, positions and
         inputs.
 
-        The rocket body and each nested component are reseeded from their own
-        child of a ``SeedSequence`` root, so two that sample the same
-        distribution stop drawing the same values. Children are spawned in a
-        fixed order, so one seed still reproduces the whole rocket.
+        Each component takes its own child of a ``SeedSequence`` root, spawned
+        in a fixed order, so components stay independent and one seed still
+        reproduces the rocket.
 
         Parameters
         ----------
@@ -220,8 +216,7 @@ class StochasticRocket(StochasticModel):
             The components which contains the stochastic structure that
             will be used to create the new components.
         root : numpy.random.SeedSequence
-            The reseed's root. Each component takes its own spawned child, so
-            components sampling the same distribution stay independent.
+            The reseed's root. Each component takes its own spawned child.
 
         Returns
         -------
