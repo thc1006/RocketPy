@@ -278,6 +278,26 @@ reliability of your simulations over time.
 .. which parameters most significantly impact your simulation results.
 
 
+Seeding a rocket's components
+-----------------------------
+
+A ``StochasticRocket`` holds nested stochastic objects: the motors, the
+aerodynamic surfaces, the rail buttons, the parachutes and the air brakes. Each
+of them samples from a stream of its own, derived from the seed the rocket was
+given, so two components built from the same spec draw independently. A main and
+a drogue parachute given the same ``cd_s`` and ``lag`` will not draw the same
+values as each other.
+
+Each kind of component is derived separately, so adding a fin does not move what
+the parachutes draw. Within one kind the stream follows insertion order, so
+adding a component ahead of another does change what the later one draws under a
+fixed seed. The rocket's own inputs, such as ``mass`` and ``radius``, use the
+seed exactly as given.
+
+.. note::
+    A component's *position* is a property of the rocket rather than of the
+    component, so it is drawn from the rocket's own stream.
+
 Conclusion
 ----------
 
