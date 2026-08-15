@@ -42,7 +42,6 @@ from rocketpy.simulation.monte_carlo import (
     _seed_sequence_to_int,
     _SimMonitor,
     _validate_simulation_count,
-    _warn_when_appending_leaves_the_lineage,
 )
 
 _root_seed_sequence = MonteCarlo._MonteCarlo__root_seed_sequence

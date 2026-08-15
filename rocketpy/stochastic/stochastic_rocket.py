@@ -533,6 +533,10 @@ class StochasticRocket(StochasticModel):
         """
         for name, spec in self.__eccentricity_specs.items():
             setattr(self, name, self._validate_eccentricity(name, spec))
+            # Declared as well as set: dict_generator walks the declared inputs
+            # rather than the whole instance (#1122), and these arrive through
+            # add_cp_eccentricity after __init__ has already built that list.
+            self._declare_stochastic_input(name)
 
     def _validate_eccentricity(self, eccentricity, position):
         """Validate the eccentricity argument.

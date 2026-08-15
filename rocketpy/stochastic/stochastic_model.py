@@ -165,6 +165,15 @@ class StochasticModel:
             )
         return self.__nominal_values[input_name]
 
+    def _declare_stochastic_input(self, input_name):
+        """Add an input that arrives after ``__init__`` to the declared set.
+
+        ``dict_generator`` walks the declared inputs rather than the instance
+        (#1122), so anything added later, such as an eccentricity, has to say so
+        or it is never sampled.
+        """
+        self.__stochastic_dict.setdefault(input_name, None)
+
     def _set_stochastic(self, seed=None):
         """Set the stochastic attributes from the input dictionary.
         This method is useful to reset or reseed the attributes of the instance.

@@ -15,7 +15,6 @@ import os
 import tempfile
 import threading
 import types
-import warnings
 
 import numpy as np
 import pytest
