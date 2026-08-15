@@ -4,7 +4,11 @@ import pytest
 from rocketpy import Environment
 from rocketpy.mathutils.function import Function
 from rocketpy.rocket.aero_surface import FreeFormFins
-from rocketpy.stochastic import StochasticEnvironment, StochasticFreeFormFins
+from rocketpy.stochastic import (
+    StochasticEnvironment,
+    StochasticFreeFormFins,
+    StochasticRocket,
+)
 from rocketpy.stochastic.stochastic_model import _snapshot_of
 
 
@@ -213,23 +217,48 @@ def test_writing_through_the_model_attribute_cannot_move_it_either():
     assert np.array_equal(stochastic.shape_points[0], expected)
 
 
-def test_a_spread_and_distribution_tuple_does_not_drift(example_plain_env):
+def test_a_spread_and_distribution_tuple_does_not_drift():
     """The ``(std, "distribution")`` form takes its centre from the object too.
 
     The scalar test above goes through ``_validate_scalar`` and this through
-    ``_validate_tuple_length_two``, so one says nothing about the other.
+    ``_validate_tuple_length_two``, so one says nothing about the other. Each
+    run gets its own Environment, since ``create_object`` writes onto it.
     """
-    example_plain_env.elevation = 100.0
-    stochastic = StochasticEnvironment(
-        environment=example_plain_env, elevation=(5.0, "normal")
-    )
 
-    elevations = []
-    for _ in range(4):
-        stochastic._set_stochastic(2024)
-        elevations.append(float(stochastic.create_object().elevation))
+    def elevation_after(seeds):
+        environment = Environment()
+        environment.set_atmospheric_model(type="standard_atmosphere")
+        environment.elevation = 100.0
+        stochastic = StochasticEnvironment(
+            environment=environment, elevation=(5.0, "normal")
+        )
+        drawn = None
+        for seed in seeds:
+            stochastic._set_stochastic(seed)
+            drawn = float(stochastic.create_object().elevation)
+        return drawn
 
-    assert len(set(elevations)) == 1, f"the centre drifted: {elevations}"
+    assert elevation_after([2024, 2024]) == elevation_after([2024])
+    assert elevation_after([7, 11, 2024]) == elevation_after([2024])
+
+
+def test_an_input_added_after_the_model_takes_its_nominal_then(calisto):
+    """An ``add_*`` input is configured after ``__init__``, so it is read then.
+
+    A scalar spec centres on the object's own value, and ``add_cp_eccentricity``
+    is the first thing to ask for it, so what the rocket holds at that moment is
+    what gets kept.
+    """
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+
+    calisto.cp_eccentricity_x = 0.5
+    stochastic.add_cp_eccentricity(x=0.001)
+    calisto.cp_eccentricity_x = 9.0
+
+    stochastic._set_stochastic(11)
+    drawn = float(next(stochastic.dict_generator())["cp_eccentricity_x"])
+
+    assert abs(drawn - 0.5) < 0.05, f"centred on {drawn}, not on the add-time 0.5"
 
 
 def test_the_snapshot_keeps_by_reference_what_it_does_not_copy():
