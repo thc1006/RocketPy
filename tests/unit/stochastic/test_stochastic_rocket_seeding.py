@@ -6,6 +6,7 @@ the same values, and one seed still reproduces the whole rocket.
 import ast
 import inspect
 
+from rocketpy.rocket.components import Components
 from rocketpy.stochastic import StochasticAirBrakes, StochasticParachute
 from rocketpy.stochastic.stochastic_model import StochasticModel
 
@@ -28,6 +29,13 @@ def _seeds_handed_out(monkeypatch, rocket, seed):
 
 def _drawn(component):
     return next(component.dict_generator())
+
+
+def _members_of(collection):
+    """Components yields (component, position) pairs; a plain list does not."""
+    if isinstance(collection, Components):
+        return [component for component, _ in collection]
+    return list(collection)
 
 
 def test_two_components_with_one_spec_do_not_draw_the_same_values(
@@ -159,3 +167,71 @@ def test_adding_a_surface_leaves_the_other_collections_alone(
     stochastic_calisto.add_nose(stochastic_nose_cone, position=1.1)
 
     assert parachute_draw() == before
+
+
+def test_every_entry_is_reseeded_exactly_once(
+    monkeypatch, stochastic_calisto, calisto_main_chute, calisto_air_brakes_clamp_on
+):
+    """Counted rather than read off the source.
+
+    The scan above reads ``create_object`` for ``for x in self.collection``, so
+    a helper, a local alias or a ``getattr`` would hide a collection from it.
+    This counts what actually happens.
+    """
+    stochastic_calisto.add_parachute(
+        StochasticParachute(parachute=calisto_main_chute, cd_s=0.1, lag=0.2)
+    )
+    stochastic_calisto.add_air_brakes(
+        StochasticAirBrakes(
+            air_brakes=calisto_air_brakes_clamp_on.air_brakes[0],
+            deployment_level=(0.5, 0.1),
+        ),
+        calisto_air_brakes_clamp_on._controllers[0],
+    )
+
+    counted = {}
+
+    def recording(self, seed=None):
+        counted[id(self)] = counted.get(id(self), 0) + 1
+        return _REAL_SET_STOCHASTIC(self, seed)
+
+    monkeypatch.setattr(StochasticModel, "_set_stochastic", recording)
+    stochastic_calisto._set_stochastic(3)
+
+    entries = [
+        component
+        for name in type(stochastic_calisto)._stochastic_collections()
+        for component in _members_of(getattr(stochastic_calisto, name))
+    ]
+
+    assert entries, "no components to count"
+    assert all(counted.get(id(entry)) == 1 for entry in entries), {
+        type(entry).__name__: counted.get(id(entry)) for entry in entries
+    }
+
+
+def test_two_air_brakes_with_one_spec_stay_independent(
+    stochastic_calisto, calisto_air_brakes_clamp_on
+):
+    """The air brakes are a plain list, so they take a different route through
+    the reseed than the positioned collections do."""
+    for _ in range(2):
+        stochastic_calisto.add_air_brakes(
+            StochasticAirBrakes(
+                air_brakes=calisto_air_brakes_clamp_on.air_brakes[0],
+                deployment_level=(0.5, 0.1),
+            ),
+            calisto_air_brakes_clamp_on._controllers[0],
+        )
+
+    def drawn(seed):
+        stochastic_calisto._set_stochastic(seed)
+        return [
+            _drawn(brake)["deployment_level"] for brake in stochastic_calisto.air_brakes
+        ]
+
+    first = drawn(808)
+
+    assert first[0] != first[1], "two air brakes drew the same value"
+    assert drawn(808) == first
+    assert drawn(809) != first
