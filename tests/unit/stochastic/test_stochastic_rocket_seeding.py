@@ -38,7 +38,7 @@ def _members_of(collection):
     return list(collection)
 
 
-def test_two_components_with_one_spec_do_not_draw_the_same_values(
+def test_two_components_with_one_spec_do_not_share_one_stream(
     stochastic_calisto, calisto_main_chute
 ):
     """The whole rocket shared one seed, so two parachutes built from the same
