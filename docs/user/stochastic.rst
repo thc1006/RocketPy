@@ -292,7 +292,11 @@ on equal values, and a specification with no spread always will.
 The reset is what builds the tree, not ``add_parachute`` or ``add_nose``. A
 rocket resets itself once while being constructed, when it has no components
 yet, so anything attached afterwards keeps the generator it was built with until
-the next reset. A Monte Carlo run resets the rocket for you.
+something resets it again. A serial ``MonteCarlo`` run does not reset it at
+all, and a parallel one resets each worker once rather than once per
+simulation, so what a study sees today depends on which of those it uses.
+Resetting per simulation, from a seed the caller chooses, is what the Monte
+Carlo seeding work adds.
 
 Each collection is spawned separately, so adding an aerodynamic surface does not
 move what the parachutes draw. Within a collection the stream follows insertion
@@ -309,9 +313,9 @@ draws under a fixed seed. The rocket's own inputs, such as ``mass`` and
     or sharing one between two rockets, is not supported: the second reset
     replaces the first, and the two entries end up drawing from one generator.
 
-    Two wrappers whose ``CustomSampler`` inputs share a ``seed_group`` are one
-    stream on purpose, and stay that way. That is what a shared group is for,
-    and separate component streams are not meant to take it apart.
+    A shared ``CustomSampler.seed_group`` keeps its own rule: a group belongs to
+    one model. Sharing one between two components leaves each of them seeding it
+    from their own child, and the last one to be reset decides what both draw.
 
 Conclusion
 ----------
