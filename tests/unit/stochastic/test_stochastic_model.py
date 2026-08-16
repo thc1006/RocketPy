@@ -12,6 +12,7 @@ from rocketpy.rocket.aero_surface import FreeFormFins
 from rocketpy.stochastic import (
     StochasticEnvironment,
     StochasticFreeFormFins,
+    StochasticParachute,
     StochasticRocket,
 )
 from rocketpy.stochastic.stochastic_model import StochasticModel, _snapshot_of
@@ -477,9 +478,9 @@ def test_the_record_of_a_draw_is_not_a_window_onto_the_object(
 def test_a_subclass_that_adjusts_a_draw_records_it_again():
     """The base class records before a subclass has had its turn.
 
-    ``StochasticFreeFormFins`` pulls the fin root back onto the body line after
-    ``super().dict_generator()`` has already recorded, so the record held the
-    outline the correction replaced. Read off the source, because the subclass
+    ``StochasticFreeFormFins`` corrects the outline in ``dict_generator`` and
+    ``StochasticParachute`` adds the pressure noise seed in ``create_object``,
+    both after the record was taken. Read off the source, because the subclass
     that gets this wrong is the one nobody wrote a fixture for.
     """
     offenders = []
@@ -487,19 +488,38 @@ def test_a_subclass_that_adjusts_a_draw_records_it_again():
         model = getattr(stochastic_package, name)
         if not isinstance(model, type) or not issubclass(model, StochasticModel):
             continue
-        if "dict_generator" not in vars(model):
-            continue
-        source = textwrap.dedent(inspect.getsource(model.dict_generator))
-        body = ast.parse(source).body[0].body
-        writes = [
-            node
-            for node in ast.walk(ast.Module(body=body, type_ignores=[]))
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Subscript) for target in node.targets)
-        ]
-        records = "_record_draw" in source
-        if writes and not records:
-            offenders.append(name)
+        for method in ("dict_generator", "create_object"):
+            if method not in vars(model):
+                continue
+            source = textwrap.dedent(inspect.getsource(vars(model)[method]))
+            body = ast.parse(source).body[0].body
+            # Only the names the method binds from a draw. A local it fills
+            # in for its own use, such as the factors StochasticEnvironment
+            # collects, is not a record of anything.
+            drawn = {
+                target.id
+                for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+                if isinstance(node, ast.Assign)
+                and (
+                    "dict_generator" in ast.dump(node.value)
+                    or method == "dict_generator"
+                )
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            writes = [
+                node
+                for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in drawn
+                    for target in node.targets
+                )
+            ]
+            if writes and "_record_draw" not in source:
+                offenders.append(f"{name}.{method}")
 
     assert not offenders, (
         f"these override dict_generator, write into the drawn dictionary and "
@@ -574,3 +594,33 @@ def test_choosing_between_no_candidates_gives_back_an_empty_copy(example_plain_e
 
     assert chosen == []
     assert chosen is not empty
+
+
+def test_a_parachute_records_the_noise_seed_it_was_built_with(calisto_main_chute):
+    """``create_object`` derives the pressure noise seed after the draw.
+
+    The parachute is built with it either way, so a record taken before it
+    describes a parachute whose noise nobody can reproduce.
+    """
+    stochastic = StochasticParachute(parachute=calisto_main_chute, cd_s=0.1, lag=0.2)
+    stochastic._set_stochastic(42)
+
+    built = stochastic.create_object()
+
+    assert stochastic.last_rnd_dict["seed"] == built._seed
+
+
+def test_a_rocket_records_the_noise_seed_its_parachute_was_built_with(
+    stochastic_calisto, calisto_main_chute
+):
+    """The same once nested, which is the shape a Monte Carlo writes out."""
+    stochastic_calisto.parachutes = []
+    stochastic_calisto.add_parachute(
+        StochasticParachute(parachute=calisto_main_chute, cd_s=0.1, lag=0.2)
+    )
+    stochastic_calisto._set_stochastic(42)
+
+    rocket = stochastic_calisto.create_object()
+
+    recorded = stochastic_calisto.last_rnd_dict["parachutes"][0]["seed"]
+    assert recorded == rocket.parachutes[0]._seed
