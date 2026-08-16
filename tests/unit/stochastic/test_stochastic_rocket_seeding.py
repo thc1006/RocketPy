@@ -7,7 +7,11 @@ import ast
 import inspect
 
 from rocketpy.rocket.components import Components
-from rocketpy.stochastic import StochasticAirBrakes, StochasticParachute
+from rocketpy.stochastic import (
+    StochasticAirBrakes,
+    StochasticParachute,
+    StochasticRocket,
+)
 from rocketpy.stochastic.stochastic_model import StochasticModel
 
 # Captured before any patching, so wrapping it twice in one test does not stack.
@@ -249,3 +253,21 @@ def test_the_rocket_body_keeps_the_seed_as_given(monkeypatch, stochastic_calisto
     seeds = _seeds_handed_out(monkeypatch, stochastic_calisto, 42)
 
     assert seeds[0] == 42
+
+
+def test_the_tree_is_built_by_the_reset_not_by_the_add(calisto, calisto_main_chute):
+    """A rocket resets itself while being constructed, with nothing attached.
+
+    So a component added afterwards keeps the generator it was built with until
+    the next reset, which is the guarantee the documentation states and the one
+    a Monte Carlo relies on.
+    """
+    rocket = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    chute = StochasticParachute(parachute=calisto_main_chute, cd_s=0.1, lag=0.2)
+    rocket.add_parachute(chute)
+
+    assert getattr(chute, "_seed", None) is None
+
+    rocket._set_stochastic(99)
+
+    assert chute._seed is not None

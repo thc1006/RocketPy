@@ -283,10 +283,16 @@ Seeding a rocket's components
 
 A ``StochasticRocket`` holds nested stochastic objects: the motors, the
 aerodynamic surfaces, the rail buttons, the parachutes and the air brakes. Each
-of them samples from a stream of its own, spawned from the seed the rocket was
-given, so a main and a drogue parachute built from the same ``cd_s`` and ``lag``
-are no longer made to consume the same draws as each other. Independent streams
-can still land on equal values, and a specification with no spread always will.
+time the rocket is reset, every component attached to it at that moment is given
+a stream of its own, spawned from the seed the reset was given. A main and a
+drogue parachute built from the same ``cd_s`` and ``lag`` are then no longer
+made to consume the same draws as each other. Independent streams can still land
+on equal values, and a specification with no spread always will.
+
+The reset is what builds the tree, not ``add_parachute`` or ``add_nose``. A
+rocket resets itself once while being constructed, when it has no components
+yet, so anything attached afterwards keeps the generator it was built with until
+the next reset. A Monte Carlo run resets the rocket for you.
 
 Each collection is spawned separately, so adding an aerodynamic surface does not
 move what the parachutes draw. Within a collection the stream follows insertion
@@ -302,6 +308,10 @@ draws under a fixed seed. The rocket's own inputs, such as ``mass`` and
     A stream belongs to one stochastic wrapper. Storing the same wrapper twice,
     or sharing one between two rockets, is not supported: the second reset
     replaces the first, and the two entries end up drawing from one generator.
+
+    Two wrappers whose ``CustomSampler`` inputs share a ``seed_group`` are one
+    stream on purpose, and stay that way. That is what a shared group is for,
+    and separate component streams are not meant to take it apart.
 
 Conclusion
 ----------
