@@ -182,7 +182,11 @@ class StochasticModel:
         has to drop it before validation reads one. Whatever a caller passes
         together is replaced together, since ``add_cp_eccentricity`` takes x
         and y in one call and a y that will not validate must not leave x
-        already replaced. ``None`` takes away what was declared before.
+        already replaced.
+
+        ``None`` leaves any earlier declaration alone. It reads the same way
+        whether the caller wrote it or left the argument out, and removing on
+        the second reading would take away an axis nobody mentioned.
         """
         inputs = tuple(inputs)
         kept = {
@@ -198,9 +202,7 @@ class StochasticModel:
             self.__nominal_values.update(kept)
             raise
         for name, value in inputs:
-            if value is None:
-                self.__stochastic_dict.pop(name, None)
-            else:
+            if value is not None:
                 self.__stochastic_dict[name] = value
         return validated
 

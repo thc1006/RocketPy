@@ -379,22 +379,23 @@ def test_a_refused_reconfiguration_leaves_the_previous_one(calisto):
     assert stochastic.cp_eccentricity_x[0] == 0.5
 
 
-def test_taking_a_late_input_away_removes_what_it_declared(calisto):
-    """``None`` is a configuration too, and it has to survive a reseed.
+def test_leaving_an_axis_out_does_not_take_away_what_it_declared(calisto):
+    """``None`` reads the same whether it was written or the argument was
+    left out, so a call that mentions only x has to leave y where it was.
 
-    The nominal was refreshed but the earlier distribution stayed declared, so
-    the next ``_set_stochastic`` validated it again and drew an uncertainty the
-    caller had asked to remove.
+    Removing on the second reading would take away an axis nobody mentioned,
+    which is why removal needs an argument the caller cannot supply by
+    omission. That is #1171 rather than this change.
     """
     stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
-    stochastic.add_cp_eccentricity(x=0.001)
+    stochastic.add_cp_eccentricity(x=0.001, y=0.002)
 
-    calisto.cp_eccentricity_x = 0.8
-    stochastic.add_cp_eccentricity(x=None)
+    stochastic.add_cp_eccentricity(x=0.005)
     stochastic._set_stochastic(11)
 
-    assert "cp_eccentricity_x" not in next(stochastic.dict_generator())
-    assert stochastic.cp_eccentricity_x == [0.8]
+    generated = next(stochastic.dict_generator())
+    assert "cp_eccentricity_x" in generated
+    assert "cp_eccentricity_y" in generated
 
 
 def test_a_half_that_was_never_given_is_not_declared(calisto):
