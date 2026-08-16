@@ -177,6 +177,7 @@ class StochasticModel:
         and y in one call and a y that will not validate must not leave x
         already replaced. ``None`` takes away what was declared before.
         """
+        inputs = tuple(inputs)
         kept = {
             name: self.__nominal_values.pop(name)
             for name, _ in inputs
@@ -284,8 +285,10 @@ class StochasticModel:
             One of the candidates, or ``values`` itself when there are none.
         """
         if len(values) == 0:
-            return values
-        return values[self.__choice_generator.integers(len(values))]
+            return _snapshot_of(values)
+        # Copied, because what this returns is handed to the object being built
+        # and would otherwise be the candidate the next draw picks again.
+        return _snapshot_of(values[self.__choice_generator.integers(len(values))])
 
     def _nominal_value(self, input_name, value):
         """Return the nominal value of an input as the distribution needs it.
@@ -805,7 +808,9 @@ class StochasticModel:
                     raise RuntimeError(
                         f"An error occurred in the 'sample' method of {arg} CustomSampler"
                     ) from e
-        self.last_rnd_dict = generated_dict
+        # A record of what was drawn, not a window onto what was built from
+        # it: the object handed the values can be written through afterwards.
+        self.last_rnd_dict = _snapshot_of(generated_dict)
         yield generated_dict
 
     # pylint: disable=too-many-statements

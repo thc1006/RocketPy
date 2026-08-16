@@ -138,9 +138,9 @@ def test_a_scalar_nominal_does_not_drift_across_reseeds():
 def test_the_nominal_is_the_one_the_input_was_configured_with(example_plain_env):
     """Snapshot semantics, stated once and pinned here.
 
-    A model samples around what the wrapped object held when it was built, so a
-    later change to that object deliberately does not move what is sampled
-    around. That is the same rule the drift above depends on.
+    A model samples around what the wrapped object held when the input was
+    configured, so a later change to that object deliberately does not move what
+    is sampled around. That is the same rule the drift above depends on.
     """
     example_plain_env.elevation = 1000
     # A scalar is a spread around the object's own value, so this is the form
@@ -154,7 +154,7 @@ def test_the_nominal_is_the_one_the_input_was_configured_with(example_plain_env)
     model._set_stochastic(4242)
 
     assert model.elevation[0] == around_first == 1000, (
-        "the model followed the object instead of the value it was built with"
+        "the model followed the object instead of the value it was configured with"
     )
 
 
@@ -429,3 +429,41 @@ def test_a_pair_of_late_inputs_is_replaced_together(calisto):
     assert "cp_eccentricity_x" not in generated
     assert generated["cp_eccentricity_y"] is not None
     assert stochastic.cp_eccentricity_y[0] == 0.6
+
+
+def test_one_generated_object_cannot_change_the_next_one(calisto_free_form_fins):
+    """``create_object`` can be called again without a reseed in between.
+
+    The list branch handed back the candidate itself, which for an empty spec is
+    the model's own working outline, and ``FreeFormFins`` keeps it by reference.
+    Writing through the first fins therefore reached the second ones.
+    """
+    expected = [tuple(point) for point in calisto_free_form_fins.shape_points]
+    stochastic = StochasticFreeFormFins(
+        free_form_fins=calisto_free_form_fins, shape_points=None
+    )
+
+    first = stochastic.create_object()
+    first.shape_points[1] = (9.9, 9.9)
+    second = stochastic.create_object()
+
+    assert [tuple(point) for point in second.shape_points] == expected
+
+
+def test_the_record_of_a_draw_is_not_a_window_onto_the_object(
+    calisto_free_form_fins,
+):
+    """``last_rnd_dict`` says what was drawn.
+
+    A Monte Carlo writes it out after the flight has run, so a value the flight
+    edited in place would be logged instead of the one that was sampled.
+    """
+    stochastic = StochasticFreeFormFins(
+        free_form_fins=calisto_free_form_fins, shape_points=None
+    )
+
+    generated = stochastic.create_object()
+    recorded = np.array(stochastic.last_rnd_dict["shape_points"], copy=True)
+    generated.shape_points[1] = (9.9, 9.9)
+
+    assert np.array_equal(stochastic.last_rnd_dict["shape_points"], recorded)
