@@ -31,7 +31,7 @@ from .stochastic_aero_surfaces import (
     StochasticTail,
     StochasticTrapezoidalFins,
 )
-from .stochastic_model import StochasticModel, _snapshot_of
+from .stochastic_model import StochasticModel
 from .stochastic_parachute import StochasticParachute
 from .stochastic_solid_motor import StochasticSolidMotor
 
@@ -682,7 +682,7 @@ class StochasticRocket(StochasticModel):
         generated_dict["rail_buttons"] = []
         generated_dict["air_brakes"] = []
         generated_dict["parachutes"] = []
-        self.last_rnd_dict = _snapshot_of(generated_dict)
+        self._record_draw(generated_dict)
         yield generated_dict
 
     def _create_motor(self, component_stochastic_motor):

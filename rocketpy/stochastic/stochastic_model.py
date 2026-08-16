@@ -83,9 +83,6 @@ def _sampler_seed(seed, input_names):
     return sum(int(word) << (32 * position) for position, word in enumerate(words))
 
 
-_MISSING = object()
-
-
 # TODO: Stop using assert in production code. Use exceptions instead.
 # TODO: Each validation method should have a test case.
 
@@ -151,6 +148,16 @@ class StochasticModel:
         self.__nominal_values = {}
         self._set_stochastic(seed)
 
+    def _record_draw(self, generated_dict):
+        """Records what this model published, after any subclass has finished.
+
+        A record of the draw rather than a window onto what was built from it,
+        since the object handed those values can be written through afterwards.
+        A subclass that adjusts a value has to call this again, or the record
+        keeps what it replaced.
+        """
+        self.last_rnd_dict = _snapshot_of(generated_dict)
+
     def _nominal(self, input_name, getter=getattr):
         """Returns what ``self.obj`` held for ``input_name`` when it was
         configured.
@@ -196,22 +203,6 @@ class StochasticModel:
             else:
                 self.__stochastic_dict[name] = value
         return validated
-
-    def _declare_stochastic_input(self, input_name, input_value):
-        """Declare an input that an ``add_*`` method installs after ``__init__``.
-
-        ``dict_generator`` walks the inputs a model declared rather than every
-        attribute on it (#1109), and that list is built in ``__init__``. Anything
-        added afterwards is set on the instance and never drawn from unless it
-        says so here.
-
-        The value is the argument as given, not the validated form, because
-        ``_set_stochastic`` validates it again on every reseed and binds the
-        distribution to the generator that is live then.
-        """
-        if input_value is None:
-            return
-        self.__stochastic_dict[input_name] = input_value
 
     def _set_stochastic(self, seed=None):
         """Set the stochastic attributes from the input dictionary.
@@ -808,9 +799,7 @@ class StochasticModel:
                     raise RuntimeError(
                         f"An error occurred in the 'sample' method of {arg} CustomSampler"
                     ) from e
-        # A record of what was drawn, not a window onto what was built from
-        # it: the object handed the values can be written through afterwards.
-        self.last_rnd_dict = _snapshot_of(generated_dict)
+        self._record_draw(generated_dict)
         yield generated_dict
 
     # pylint: disable=too-many-statements

@@ -1,6 +1,11 @@
+import ast
+import inspect
+import textwrap
+
 import numpy as np
 import pytest
 
+import rocketpy.stochastic as stochastic_package
 from rocketpy import Environment
 from rocketpy.mathutils.function import Function
 from rocketpy.rocket.aero_surface import FreeFormFins
@@ -9,7 +14,7 @@ from rocketpy.stochastic import (
     StochasticFreeFormFins,
     StochasticRocket,
 )
-from rocketpy.stochastic.stochastic_model import _snapshot_of
+from rocketpy.stochastic.stochastic_model import StochasticModel, _snapshot_of
 
 
 @pytest.mark.parametrize(
@@ -467,3 +472,93 @@ def test_the_record_of_a_draw_is_not_a_window_onto_the_object(
     generated.shape_points[1] = (9.9, 9.9)
 
     assert np.array_equal(stochastic.last_rnd_dict["shape_points"], recorded)
+
+
+def test_a_subclass_that_adjusts_a_draw_records_it_again():
+    """The base class records before a subclass has had its turn.
+
+    ``StochasticFreeFormFins`` pulls the fin root back onto the body line after
+    ``super().dict_generator()`` has already recorded, so the record held the
+    outline the correction replaced. Read off the source, because the subclass
+    that gets this wrong is the one nobody wrote a fixture for.
+    """
+    offenders = []
+    for name in dir(stochastic_package):
+        model = getattr(stochastic_package, name)
+        if not isinstance(model, type) or not issubclass(model, StochasticModel):
+            continue
+        if "dict_generator" not in vars(model):
+            continue
+        source = textwrap.dedent(inspect.getsource(model.dict_generator))
+        body = ast.parse(source).body[0].body
+        writes = [
+            node
+            for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Subscript) for target in node.targets)
+        ]
+        records = "_record_draw" in source
+        if writes and not records:
+            offenders.append(name)
+
+    assert not offenders, (
+        f"these override dict_generator, write into the drawn dictionary and "
+        f"never call _record_draw, so the record keeps what they replaced: "
+        f"{sorted(offenders)}"
+    )
+
+
+def test_the_record_holds_the_outline_the_fins_were_built_from(
+    calisto_free_form_fins,
+):
+    """A perturbed outline is pulled back onto the body line after it is drawn.
+
+    Under seed 7 the two root points drift to 0.000299 and 0.001340 and the
+    correction returns them to zero, so a record taken before it reports an
+    outline the fins were never built from.
+    """
+    stochastic = StochasticFreeFormFins(
+        free_form_fins=calisto_free_form_fins, shape_points=0.001
+    )
+    stochastic._set_stochastic(7)
+
+    built = stochastic.create_object()
+
+    assert np.array_equal(
+        np.asarray(stochastic.last_rnd_dict["shape_points"], dtype=float),
+        np.asarray(built.shape_points, dtype=float),
+    )
+
+
+def test_a_rocket_records_the_outline_its_fins_were_built_from(
+    stochastic_calisto, stochastic_free_form_fins
+):
+    """The same, once the fins are nested in a rocket.
+
+    ``_create_surface`` copies each component's own record into the rocket's,
+    so a component that recorded too early reaches the Monte Carlo input log.
+    """
+    # A tuple position carries its own centre, so it does not go looking for
+    # matching fins on a deterministic rocket that has none.
+    stochastic_calisto.add_free_form_fins(
+        stochastic_free_form_fins, position=(-1.05, 0.001)
+    )
+    stochastic_calisto._set_stochastic(7)
+
+    rocket = stochastic_calisto.create_object()
+
+    recorded = next(
+        entry["shape_points"]
+        for entry in stochastic_calisto.last_rnd_dict["aerodynamic_surfaces"]
+        if "shape_points" in entry
+    )
+    built = next(
+        surface
+        for surface in rocket.aerodynamic_surfaces.get_components()
+        if isinstance(surface, FreeFormFins)
+    )
+
+    assert np.array_equal(
+        np.asarray(recorded, dtype=float),
+        np.asarray(built.shape_points, dtype=float),
+    )
