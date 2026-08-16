@@ -273,12 +273,12 @@ class StochasticModel:
         Returns
         -------
         object
-            One of the candidates, or ``values`` itself when there are none.
+            A copy of one of the candidates, or of ``values`` when there are
+            none. Copied because what this returns is handed to the object
+            being built.
         """
         if len(values) == 0:
             return _snapshot_of(values)
-        # Copied, because what this returns is handed to the object being built
-        # and would otherwise be the candidate the next draw picks again.
         return _snapshot_of(values[self.__choice_generator.integers(len(values))])
 
     def _nominal_value(self, input_name, value):

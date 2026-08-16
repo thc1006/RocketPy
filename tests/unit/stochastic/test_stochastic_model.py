@@ -562,3 +562,15 @@ def test_a_rocket_records_the_outline_its_fins_were_built_from(
         np.asarray(recorded, dtype=float),
         np.asarray(built.shape_points, dtype=float),
     )
+
+
+def test_choosing_between_no_candidates_gives_back_an_empty_copy(example_plain_env):
+    """Validation never produces an empty candidate list, so this is the guard
+    that keeps ``integers(0)`` from raising if one ever reaches here."""
+    model = StochasticEnvironment(environment=example_plain_env)
+    empty = []
+
+    chosen = model._choose(empty)
+
+    assert chosen == []
+    assert chosen is not empty
