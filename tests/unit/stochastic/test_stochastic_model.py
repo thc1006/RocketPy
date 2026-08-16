@@ -5,7 +5,6 @@ import textwrap
 import numpy as np
 import pytest
 
-import rocketpy.stochastic as stochastic_package
 from rocketpy import Environment
 from rocketpy.mathutils.function import Function
 from rocketpy.rocket.aero_surface import FreeFormFins
@@ -483,11 +482,17 @@ def test_a_subclass_that_adjusts_a_draw_records_it_again():
     both after the record was taken. Read off the source, because the subclass
     that gets this wrong is the one nobody wrote a fixture for.
     """
+    # Walked from the base class rather than from what the package exports,
+    # since StochasticMotorModel is a subclass the exports do not reach.
+    models, stack = set(), [StochasticModel]
+    while stack:
+        for subclass in stack.pop().__subclasses__():
+            models.add(subclass)
+            stack.append(subclass)
+
     offenders = []
-    for name in dir(stochastic_package):
-        model = getattr(stochastic_package, name)
-        if not isinstance(model, type) or not issubclass(model, StochasticModel):
-            continue
+    for model in sorted(models, key=lambda cls: cls.__name__):
+        name = model.__name__
         for method in ("dict_generator", "create_object"):
             if method not in vars(model):
                 continue
