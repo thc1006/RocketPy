@@ -189,16 +189,28 @@ class StochasticModel:
         the second reading would take away an axis nobody mentioned.
         """
         inputs = tuple(inputs)
+        # A None that already has a configuration is an axis the caller left
+        # out, since an omitted argument arrives the same way. It keeps what it
+        # had: not validated again, and its kept nominal not read again.
+        untouched = {
+            name
+            for name, value in inputs
+            if value is None and name in self.__stochastic_dict
+        }
         kept = {
             name: self.__nominal_values.pop(name)
             for name, _ in inputs
-            if name in self.__nominal_values
+            if name not in untouched and name in self.__nominal_values
         }
         try:
-            validated = [validate(name, value) for name, value in inputs]
+            validated = [
+                getattr(self, name) if name in untouched else validate(name, value)
+                for name, value in inputs
+            ]
         except BaseException:
             for name, _ in inputs:
-                self.__nominal_values.pop(name, None)
+                if name not in untouched:
+                    self.__nominal_values.pop(name, None)
             self.__nominal_values.update(kept)
             raise
         for name, value in inputs:

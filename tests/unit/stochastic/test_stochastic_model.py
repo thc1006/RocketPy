@@ -379,6 +379,41 @@ def test_a_refused_reconfiguration_leaves_the_previous_one(calisto):
     assert stochastic.cp_eccentricity_x[0] == 0.5
 
 
+@pytest.mark.parametrize(
+    ("add_them", "kept"),
+    [
+        ("add_cp_eccentricity", "cp_eccentricity_y"),
+        ("add_thrust_eccentricity", "thrust_eccentricity_y"),
+    ],
+)
+def test_an_axis_left_out_keeps_everything_it_had(calisto, add_them, kept):
+    """Not only its declaration: its distribution and its kept nominal too.
+
+    Keeping the declaration alone left the two disagreeing. The private side
+    still said the axis was random while the validated attribute had been
+    replaced by a lone nominal, and ``dict_generator`` reads the attribute, so
+    the axis stopped varying until something reset the model. A serial Monte
+    Carlo never does, so a whole study would have run with it switched off.
+    """
+    setattr(calisto, kept, 0.0)
+    stochastic = StochasticRocket(rocket=calisto, radius=0.0127 / 2)
+    getattr(stochastic, add_them)(x=0.001, y=0.002)
+    stochastic._set_stochastic(11)
+    centre = getattr(stochastic, kept)[0]
+
+    # Moved between the calls, so re-reading the nominal would show up.
+    setattr(calisto, kept, 9.0)
+    getattr(stochastic, add_them)(x=0.005)
+
+    drawn = {next(stochastic.dict_generator())[kept] for _ in range(8)}
+    assert len(drawn) == 8, "the axis stopped varying before any reset"
+
+    stochastic._set_stochastic(11)
+
+    assert getattr(stochastic, kept)[0] == centre
+    assert kept in next(stochastic.dict_generator())
+
+
 def test_leaving_an_axis_out_does_not_take_away_what_it_declared(calisto):
     """``None`` reads the same whether it was written or the argument was
     left out, so a call that mentions only x has to leave y where it was.
