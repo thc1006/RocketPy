@@ -1,53 +1,75 @@
+import json
 import os
 from types import SimpleNamespace
 
 import pytest
 
+from rocketpy.simulation import monte_carlo as mc_module
 from rocketpy.simulation.monte_carlo import MonteCarlo
 
 
 class _Mutex:
+    def __init__(self):
+        self.held = False
+        self.acquired = 0
+
     def acquire(self):
-        pass
+        self.acquired += 1
+        self.held = True
 
     def release(self):
-        pass
+        self.held = False
 
 
 class _ErrorEvent:
-    def __init__(self):
+    def __init__(self, refuse=False):
         self.was_set = False
+        self.refuse = refuse
 
     def is_set(self):
         return self.was_set
 
     def set(self):
+        if self.refuse:
+            raise OSError("the manager is gone")
         self.was_set = True
 
 
-def _a_worker(tmp_path, model):
+def _raise_instead(message):
+    def refuse(*_args, **_kwargs):
+        raise OSError(message)
+
+    return refuse
+
+
+def _refusing_model():
+    def refuse(_seed):
+        raise RuntimeError("the models would not reseed")
+
+    return SimpleNamespace(last_rnd_dict={}, _set_stochastic=refuse)
+
+
+def _a_worker(tmp_path, model, event=None):
     study = MonteCarlo(
-        filename=os.path.join(str(tmp_path), "study"),
+        filename=str(tmp_path / "study"),
         environment=model,
         rocket=model,
         flight=model,
     )
-    return study, _ErrorEvent()
+    return study, event or _ErrorEvent()
 
 
-def _run(study, monitor, error_event, seed=42):
+def _run(study, monitor, error_event, mutex=None):
     # Name-mangled: the producer is what each worker process runs, and nothing
     # else in the suite calls it.
-    study._MonteCarlo__sim_producer(seed, monitor, _Mutex(), error_event)
+    mutex = mutex or _Mutex()
+    study._MonteCarlo__sim_producer(42, monitor, mutex, error_event)
+    return mutex
 
 
 def test_a_worker_that_fails_before_seeding_finishes_says_so(tmp_path, capsys):
-    def refuse(_seed):
-        raise RuntimeError("the models would not reseed")
-
-    model = SimpleNamespace(last_rnd_dict={}, _set_stochastic=refuse)
     monitor = SimpleNamespace(keep_simulating=lambda: True)
-    study, error_event = _a_worker(tmp_path, model)
+    study, error_event = _a_worker(tmp_path, _refusing_model())
 
     _run(study, monitor, error_event)
 
@@ -92,18 +114,20 @@ def test_a_worker_that_fails_inside_a_simulation_names_the_index(
     assert "iteration 7" in capsys.readouterr().out
 
 
-def test_the_error_file_is_left_alone_when_nothing_was_drawn(tmp_path):
-    def refuse(_seed):
-        raise RuntimeError("the models would not reseed")
-
-    model = SimpleNamespace(last_rnd_dict={}, _set_stochastic=refuse)
+def test_a_startup_failure_is_written_down_and_not_only_printed(tmp_path):
+    # The caller is told to read the error file, and a traceback the worker
+    # printed is not there to be read once its output has been redirected.
     monitor = SimpleNamespace(keep_simulating=lambda: True)
-    study, error_event = _a_worker(tmp_path, model)
+    study, error_event = _a_worker(tmp_path, _refusing_model())
 
     _run(study, monitor, error_event)
 
     with open(study.error_file, "r", encoding="utf-8") as recorded:
-        assert recorded.read() == ""
+        rows = [json.loads(line) for line in recorded if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["index"] is None
+    assert rows[0]["stage"] == "worker startup"
+    assert "the models would not reseed" in rows[0]["error"]
 
 
 @pytest.mark.parametrize("failing", ["_set_stochastic", "increment"])
@@ -126,3 +150,40 @@ def test_a_worker_failure_never_raises_out_of_the_producer(tmp_path, failing):
     _run(study, monitor, error_event)
 
     assert error_event.was_set
+
+
+@pytest.mark.parametrize("breaking", ["error_file", "reprint", "event"])
+def test_reporting_a_failure_never_keeps_the_mutex(tmp_path, monkeypatch, breaking):
+    # The mutex is the manager's, so a worker that ends while holding it leaves
+    # the next one waiting on a process that is gone, and the parent never
+    # reaches the join that would have noticed.
+    if breaking == "error_file":
+        monkeypatch.setattr(
+            mc_module, "_worker_failure_record", _raise_instead("no disk")
+        )
+    if breaking == "reprint":
+        monkeypatch.setattr(
+            mc_module._SimMonitor, "reprint", _raise_instead("no stdout")
+        )
+    event = _ErrorEvent(refuse=breaking == "event")
+    monitor = SimpleNamespace(keep_simulating=lambda: True)
+    study, error_event = _a_worker(tmp_path, _refusing_model(), event)
+
+    mutex = _run(study, monitor, error_event)
+
+    assert mutex.acquired == 1
+    assert not mutex.held
+
+
+def test_a_reporting_failure_does_not_replace_the_simulation_failure(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(mc_module, "_worker_failure_record", _raise_instead("no disk"))
+    monitor = SimpleNamespace(keep_simulating=lambda: True)
+    study, error_event = _a_worker(tmp_path, _refusing_model())
+
+    _run(study, monitor, error_event)
+
+    assert error_event.was_set
+    assert "the models would not reseed" in capsys.readouterr().out
+    assert not os.path.getsize(study.error_file)

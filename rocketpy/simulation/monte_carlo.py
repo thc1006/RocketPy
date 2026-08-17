@@ -18,6 +18,7 @@ import json
 import os
 import traceback
 import warnings
+from contextlib import suppress
 from numbers import Real
 from pathlib import Path
 from time import time
@@ -488,6 +489,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 for sim_producer in processes:
                     sim_producer.join()
 
+                # Before the event: a worker that was killed, or that died
+                # before its own handler could set it, leaves it clear, and the
+                # run would report the simulations it never wrote as done.
+                _refuse_a_worker_that_did_not_finish(processes)
+
                 # Handle error from the child processes
                 if simulation_error_event.is_set():
                     raise RuntimeError(
@@ -572,16 +578,29 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     mutex.release()
 
         except Exception:  # pylint: disable=broad-except
-            mutex.acquire()
-            with open(self.error_file, "a", encoding="utf-8") as f:
-                f.write(inputs_json)
-
-            # See note above: must use print() to remain visible from a
-            # multiprocessing worker process.
+            details = traceback.format_exc()
             where = "worker startup" if sim_idx is None else f"iteration {sim_idx}"
-            _SimMonitor.reprint(f"Error on {where}:\n{traceback.format_exc()}")
-            error_event.set()
-            mutex.release()
+            # Said first, and from outside the lock: a worker that cannot write
+            # its own diagnostics still has to be able to stop the others.
+            with suppress(Exception):
+                error_event.set()
+
+            mutex.acquire()
+            try:
+                # Suppressed, and every step separately: a full disk or an
+                # unwritable log would otherwise replace the failure being
+                # reported, and the lock is a manager's, so a worker that ends
+                # while holding it leaves the next one waiting on a process
+                # that no longer exists.
+                with suppress(Exception):
+                    with open(self.error_file, "a", encoding="utf-8") as f:
+                        f.write(inputs_json or _worker_failure_record(where, details))
+                with suppress(Exception):
+                    # See note above: must use print() to remain visible from a
+                    # multiprocessing worker process.
+                    _SimMonitor.reprint(f"Error on {where}:\n{details}")
+            finally:
+                mutex.release()
 
     def __run_single_simulation(self):
         """Runs a single simulation and returns the inputs and outputs.
@@ -1756,6 +1775,36 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             If no error data is available to export.
         """
         self._write_log_to_json(self.errors_log, filename)
+
+
+def _worker_failure_record(where, details):
+    """A row for a worker that failed before it drew anything.
+
+    Written because the caller is told to read the error file, and a traceback
+    a worker printed is not there to be read once its output is redirected.
+    """
+    return json.dumps({"index": None, "stage": where, "error": details}) + "\n"
+
+
+def _refuse_a_worker_that_did_not_finish(processes):
+    """Raise if any worker left without exiting cleanly.
+
+    The workers report their own failures through an event, which one that was
+    killed never reaches, so what is left of it is its exit code. A negative
+    one is the signal that ended it, and ``None`` is one still running.
+    """
+    unfinished = [
+        f"worker {position} with exit code {process.exitcode}"
+        for position, process in enumerate(processes)
+        if process.exitcode != 0
+    ]
+    if not unfinished:
+        return
+    raise RuntimeError(
+        f"The run is incomplete: {', '.join(unfinished)}. A worker that ends "
+        "this way records nothing and cannot say why, so the simulations it "
+        "held are missing from the results."
+    )
 
 
 def _import_multiprocess():
