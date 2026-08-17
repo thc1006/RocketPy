@@ -220,7 +220,11 @@ def test_two_air_brakes_with_one_spec_stay_independent(
     stochastic_calisto, calisto_air_brakes_clamp_on
 ):
     """The air brakes are a plain list, so they take a different route through
-    the reseed than the positioned collections do."""
+    the reseed than the positioned collections do.
+
+    About the streams only. Both are added with one controller because the
+    rocket keeps a single one, which is a separate problem recorded in #1172.
+    """
     for _ in range(2):
         stochastic_calisto.add_air_brakes(
             StochasticAirBrakes(

@@ -293,10 +293,10 @@ The reset is what builds the tree, not ``add_parachute`` or ``add_nose``. A
 rocket resets itself once while being constructed, when it has no components
 yet, so anything attached afterwards keeps the generator it was built with until
 something resets it again. A serial ``MonteCarlo`` run does not reset it at
-all, and a parallel one resets each worker once rather than once per
-simulation, so what a study sees today depends on which of those it uses.
-Resetting per simulation, from a seed the caller chooses, is what the Monte
-Carlo seeding work adds.
+all. A parallel one tries to, once per worker, but hands the model a
+``SeedSequence`` where an integer is wanted, so that path does not get as far
+as building the tree either. Resetting per simulation, from an integer seed the
+caller chooses, is what the Monte Carlo seeding work adds.
 
 Each collection is spawned separately, so adding an aerodynamic surface does not
 move what the parachutes draw. Within a collection the stream follows insertion
