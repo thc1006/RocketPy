@@ -6,7 +6,10 @@ the same values, and one seed still reproduces the whole rocket.
 import ast
 import inspect
 
+import numpy as np
+
 from rocketpy.rocket.components import Components
+from rocketpy.tools import _seed_sequence_from
 from rocketpy.stochastic import (
     StochasticAirBrakes,
     StochasticParachute,
@@ -275,3 +278,36 @@ def test_the_tree_is_built_by_the_reset_not_by_the_add(calisto, calisto_main_chu
     rocket._set_stochastic(99)
 
     assert chute._seed is not None
+
+
+def test_a_worker_seed_sequence_is_copied_rather_than_spawned_from():
+    # A parallel run hands each worker a SeedSequence. Spawning from it would
+    # advance a counter the caller still holds, so the next use of the same
+    # object would build a different tree.
+    worker = np.random.SeedSequence(7).spawn(2)[0]
+
+    _seed_sequence_from(worker).spawn(3)
+
+    assert worker.n_children_spawned == 0
+
+
+def test_a_worker_seed_sequence_keeps_its_place_in_the_tree():
+    worker = np.random.SeedSequence(7).spawn(2)[0]
+
+    children = _seed_sequence_from(worker).spawn(2)
+
+    assert [child.spawn_key for child in children] == [(0, 0), (0, 1)]
+
+
+def test_two_workers_do_not_get_the_same_collection_roots():
+    first, second = np.random.SeedSequence(7).spawn(2)
+
+    one = _seed_sequence_from(first).spawn(1)[0].generate_state(4)
+    other = _seed_sequence_from(second).spawn(1)[0].generate_state(4)
+
+    assert not np.array_equal(one, other)
+
+
+def test_an_integer_seed_still_roots_the_collections():
+    assert _seed_sequence_from(42).spawn(1)[0].spawn_key == (0,)
+    assert _seed_sequence_from(None).spawn(1)[0].spawn_key == (0,)

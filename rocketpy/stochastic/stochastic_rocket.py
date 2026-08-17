@@ -2,7 +2,6 @@
 
 import warnings
 
-import numpy as np
 
 from rocketpy.control import _Controller
 from rocketpy.mathutils.vector_matrix import Vector
@@ -23,7 +22,7 @@ from rocketpy.rocket.parachute import Parachute
 from rocketpy.rocket.rocket import Rocket
 from rocketpy.stochastic.stochastic_generic_motor import StochasticGenericMotor
 from rocketpy.stochastic.stochastic_motor_model import StochasticMotorModel
-from rocketpy.tools import _seed_sequence_to_int
+from rocketpy.tools import _seed_sequence_from, _seed_sequence_to_int
 
 from .stochastic_aero_surfaces import (
     StochasticAirBrakes,
@@ -203,7 +202,7 @@ class StochasticRocket(StochasticModel):
         """
         super()._set_stochastic(seed)
         names = self._stochastic_collections()
-        roots = dict(zip(names, np.random.SeedSequence(seed).spawn(len(names))))
+        roots = dict(zip(names, _seed_sequence_from(seed).spawn(len(names))))
         for name in self._POSITIONED_COLLECTIONS:
             setattr(
                 self, name, self.__reset_components(getattr(self, name), roots[name])

@@ -1475,6 +1475,18 @@ def _seed_sequence_to_int(seed_sequence):
     return sum(int(word) << (32 * position) for position, word in enumerate(words))
 
 
+def _seed_sequence_from(seed):
+    """Returns a ``SeedSequence`` of the caller's own to spawn from.
+
+    A parallel run is handed one that ``SeedSequence`` will not take as
+    entropy, and spawning from it directly would advance the counter of an
+    object the caller still holds, so it is copied from its full state.
+    """
+    if isinstance(seed, np.random.SeedSequence):
+        return np.random.SeedSequence(**seed.state)
+    return np.random.SeedSequence(seed)
+
+
 if __name__ == "__main__":  # pragma: no cover
     import doctest
 
