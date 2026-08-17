@@ -18,6 +18,7 @@ import json
 import os
 import traceback
 import warnings
+from copy import deepcopy
 from numbers import Real
 from pathlib import Path
 from time import time
@@ -31,6 +32,7 @@ from rocketpy.plots.monte_carlo_plots import _MonteCarloPlots
 from rocketpy.prints.monte_carlo_prints import _MonteCarloPrints
 from rocketpy.simulation.flight import Flight
 from rocketpy.tools import (
+    _seed_sequence_to_int,
     generate_monte_carlo_ellipses,
     generate_monte_carlo_ellipses_coordinates,
     import_optional_dependency,
@@ -42,6 +44,57 @@ from rocketpy.tools import (
 # simulate() writes one JSON object per line and reads that same shape back, so
 # this is the only format it can both resume from and overwrite safely.
 _SIMULATION_LOG_SUFFIX = ".txt"
+
+
+def _root_seed_sequence(random_seed):
+    """The immutable root a run derives every simulation's seed from.
+
+    A ``SeedSequence`` is rebuilt from its full state rather than used as
+    given, since ``spawn`` advances a counter the caller still holds. A
+    ``Generator`` is refused rather than read, because using a consume-on-use
+    object as an immutable seed cannot mean what it says.
+    """
+    if isinstance(random_seed, np.random.SeedSequence):
+        return np.random.SeedSequence(**random_seed.state)
+    if isinstance(random_seed, (np.random.Generator, np.random.BitGenerator)):
+        raise TypeError(
+            f"random_seed must be an int, a sequence of non-negative integers, "
+            f"or a numpy.random.SeedSequence, not a "
+            f"{type(random_seed).__name__}. Pass the seed the generator was "
+            f"built from."
+        )
+    return np.random.SeedSequence(random_seed)
+
+
+def _root_state_of(root):
+    """A root as the four picklable values a worker can rebuild it from.
+
+    Sent to each worker instead of the object, and instead of the list of
+    children, so a run of a million simulations costs four values. The entropy
+    is copied because a sequence one is kept by reference all the way from the
+    caller, who could otherwise still move every child by editing their list.
+    """
+    return (
+        deepcopy(root.entropy),
+        tuple(root.spawn_key),
+        root.pool_size,
+        root.n_children_spawned,
+    )
+
+
+def _seed_of_simulation(root_state, sim_idx):
+    """The seed for one simulation index, without spawning the ones before it.
+
+    ``spawn`` derives child ``i`` by appending ``n_children_spawned + i`` to
+    the parent spawn key, so rebuilding that one child directly reproduces it
+    and any index can be reached from the four values above alone.
+    """
+    entropy, spawn_key, pool_size, base = root_state
+    return np.random.SeedSequence(
+        entropy=entropy,
+        spawn_key=(*spawn_key, base + sim_idx),
+        pool_size=pool_size,
+    )
 
 
 def _refuse_logs_this_run_cannot_write(
@@ -265,6 +318,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         append=False,
         parallel=False,
         n_workers=None,
+        *,
+        random_seed=None,
         **kwargs,
     ):
         """
@@ -317,6 +372,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
         self._initial_sim_idx = self.num_of_loaded_sims if append else 0
+        # Validated here, before __setup_files truncates anything, so an
+        # unusable seed cannot cost a previous run its results. Kept as four
+        # picklable values rather than as the object, since a worker rebuilds
+        # any index from them.
+        self.__root_state = _root_state_of(_root_seed_sequence(random_seed))
 
         # Before anything is opened: __setup_files truncates for append=False.
         _refuse_logs_this_run_cannot_write(
@@ -422,6 +482,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
+                self.__seed_this_simulation(sim_idx)
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
@@ -473,13 +534,14 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
 
             processes = []
-            seeds = np.random.SeedSequence().spawn(n_workers)
 
-            for seed in seeds:
+            # No seed per worker any more: every simulation takes its own from
+            # its index, so the workers are interchangeable and how many there
+            # are does not reach the sampling.
+            for _ in range(n_workers):
                 sim_producer = multiprocess.Process(
                     target=self.__sim_producer,
                     args=(
-                        seed,
                         sim_monitor,
                         mutex,
                         simulation_error_event,
@@ -521,13 +583,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             raise ValueError("Number of workers must be at least 2 for parallel mode.")
         return n_workers
 
-    def __sim_producer(self, seed, sim_monitor, mutex, error_event):  # pylint: disable=too-many-statements
+    def __sim_producer(self, sim_monitor, mutex, error_event):
         """Simulation producer to be used in parallel by multiprocessing.
 
         Parameters
         ----------
-        seed : int
-            The seed to set the random number generator.
         sim_monitor : _SimMonitor
             The simulation monitor object to keep track of the simulations.
         mutex : multiprocess.Lock
@@ -536,15 +596,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             Event signaling an error occurred during the simulation.
         """
         try:
-            # Ensure Processes generate different random numbers
-            self.environment._set_stochastic(seed)
-            self.rocket._set_stochastic(seed)
-            self.flight._set_stochastic(seed)
-
             while sim_monitor.keep_simulating():
                 sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
+                self.__seed_this_simulation(sim_idx)
                 flight = self.__run_single_simulation()
                 inputs_json = self.__evaluate_flight_inputs(sim_idx)
                 outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
@@ -583,6 +639,20 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             )
             error_event.set()
             mutex.release()
+
+    def __seed_this_simulation(self, sim_idx):
+        """Reseed the three models from this index's own child of the root.
+
+        Per index rather than per worker, which is what makes a simulation's
+        inputs the same however the run was split up. The child is split three
+        ways so the environment, rocket and flight draw independently instead
+        of sharing one stream.
+        """
+        child = _seed_of_simulation(self.__root_state, sim_idx)
+        environment, rocket, flight = child.spawn(3)
+        self.environment._set_stochastic(_seed_sequence_to_int(environment))
+        self.rocket._set_stochastic(_seed_sequence_to_int(rocket))
+        self.flight._set_stochastic(_seed_sequence_to_int(flight))
 
     def __run_single_simulation(self):
         """Runs a single simulation and returns the inputs and outputs.
