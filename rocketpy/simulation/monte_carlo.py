@@ -577,29 +577,33 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     mutex.release()
 
         except Exception:  # pylint: disable=broad-except
-            details = traceback.format_exc()
-            where = "worker startup" if sim_idx is None else f"iteration {sim_idx}"
-            # Said first, and from outside the lock: a worker that cannot write
-            # its own diagnostics still has to be able to stop the others.
-            with suppress(Exception):
-                error_event.set()
+            self.__report_a_failed_simulation(sim_idx, inputs_json, mutex, error_event)
 
-            mutex.acquire()
-            try:
-                # Suppressed, and every step separately: a full disk or an
-                # unwritable log would otherwise replace the failure being
-                # reported, and the lock is a manager's, so a worker that ends
-                # while holding it leaves the next one waiting on a process
-                # that no longer exists.
-                with suppress(Exception):
-                    with open(self.error_file, "a", encoding="utf-8") as f:
-                        f.write(inputs_json or _worker_failure_record(where, details))
-                with suppress(Exception):
-                    # See note above: must use print() to remain visible from a
-                    # multiprocessing worker process.
-                    _SimMonitor.reprint(f"Error on {where}:\n{details}")
-            finally:
-                mutex.release()
+    def __report_a_failed_simulation(self, sim_idx, inputs_json, mutex, error_event):
+        """Write down and announce a simulation this worker could not finish.
+
+        The event goes first and from outside the lock, since a worker that
+        cannot write its diagnostics still has to be able to stop the others.
+        Each step under the lock is suppressed on its own: a full disk would
+        otherwise replace the failure being reported, and the lock is a
+        manager's, so ending while holding it leaves the next worker waiting
+        on a process that no longer exists.
+        """
+        details = traceback.format_exc()
+        where = "worker startup" if sim_idx is None else f"iteration {sim_idx}"
+        with suppress(Exception):
+            error_event.set()
+
+        mutex.acquire()
+        try:
+            with suppress(Exception):
+                with open(self.error_file, "a", encoding="utf-8") as f:
+                    f.write(inputs_json or _worker_failure_record(where, details))
+            with suppress(Exception):
+                # Must use print() to remain visible from a worker process.
+                _SimMonitor.reprint(f"Error on {where}:\n{details}")
+        finally:
+            mutex.release()
 
     def __run_single_simulation(self):
         """Runs a single simulation and returns the inputs and outputs.
