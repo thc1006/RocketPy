@@ -531,6 +531,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         error_event : multiprocess.Event
             Event signaling an error occurred during the simulation.
         """
+        # Bound before the try: the handler below reads both, and a failure in
+        # the seeding, or in the claim that opens the loop, reaches it with
+        # neither of them assigned.
+        sim_idx, inputs_json = None, ""
         try:
             # Ensure Processes generate different random numbers
             self.environment._set_stochastic(seed)
@@ -574,9 +578,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
 
             # See note above: must use print() to remain visible from a
             # multiprocessing worker process.
-            _SimMonitor.reprint(
-                f"Error on iteration {sim_idx}:\n{traceback.format_exc()}"
-            )
+            where = "worker startup" if sim_idx is None else f"iteration {sim_idx}"
+            _SimMonitor.reprint(f"Error on {where}:\n{traceback.format_exc()}")
             error_event.set()
             mutex.release()
 
