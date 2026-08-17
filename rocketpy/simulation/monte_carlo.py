@@ -413,14 +413,18 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             n_simulations=self.number_of_simulations,
             start_time=time(),
         )
+        sim_idx = sim_monitor.count
         try:
             while sim_monitor.keep_simulating():
-                sim_monitor.increment()
+                # Counted from zero, as the parallel path already does. The two
+                # named the same simulation differently: three of them wrote
+                # 1, 2, 3 here and 0, 1, 2 there.
+                sim_idx = sim_monitor.increment() - 1
                 inputs_json, outputs_json = "", ""
 
                 flight = self.__run_single_simulation()
-                inputs_json = self.__evaluate_flight_inputs(sim_monitor.count)
-                outputs_json = self.__evaluate_flight_outputs(flight, sim_monitor.count)
+                inputs_json = self.__evaluate_flight_inputs(sim_idx)
+                outputs_json = self.__evaluate_flight_outputs(flight, sim_idx)
 
                 self._append_simulation_record(inputs_json, outputs_json)
 
@@ -434,7 +438,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f.write(inputs_json)
 
         except Exception as error:
-            print(f"Error on iteration {sim_monitor.count}: {error}")
+            print(f"Error on iteration {sim_idx}: {error}")
             with open(self._error_file, "a", encoding="utf-8") as f:
                 f.write(inputs_json)
             raise error
