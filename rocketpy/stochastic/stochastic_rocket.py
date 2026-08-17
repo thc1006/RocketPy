@@ -451,6 +451,12 @@ class StochasticRocket(StochasticModel):
             the y direction relative to the center of dry mass axial line.
             The y axis is defined according to the body axes coordinate system.
 
+
+        Calling this again replaces what was configured before. An axis left
+        out keeps the setting it already had, since ``None`` is what an omitted
+        argument arrives as and cannot be told apart from one written by hand.
+        Taking an axis away again is not supported (#1171).
+
         Returns
         -------
         self : StochasticRocket
@@ -480,6 +486,12 @@ class StochasticRocket(StochasticModel):
             thrust force is to be translated in the y direction
             relative to the center of dry mass axial line. The y axis
             is defined according to the body axes coordinate system.
+
+
+        Calling this again replaces what was configured before. An axis left
+        out keeps the setting it already had, since ``None`` is what an omitted
+        argument arrives as and cannot be told apart from one written by hand.
+        Taking an axis away again is not supported (#1171).
 
         Returns
         -------
