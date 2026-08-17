@@ -486,8 +486,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 sim_producer.start()
 
             try:
-                for sim_producer in processes:
-                    sim_producer.join()
+                _join_the_workers(processes, simulation_error_event)
 
                 # Before the event: a worker that was killed, or that died
                 # before its own handler could set it, leaves it clear, and the
@@ -1775,6 +1774,51 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             If no error data is available to export.
         """
         self._write_log_to_json(self.errors_log, filename)
+
+
+# Short enough that a dead worker is noticed promptly, long enough that the
+# polling costs nothing over a run that takes hours.
+_JOIN_POLL_SECONDS = 0.2
+_SHUTDOWN_GRACE_SECONDS = 5.0
+
+
+def _ended_badly(worker):
+    """Whether a worker has stopped, and stopped for the wrong reason."""
+    return worker.exitcode not in (None, 0)
+
+
+def _stop_the_workers_still_running(processes, error_event, grace_period):
+    """Ask the rest to stop, then end the ones that cannot.
+
+    Asked first because a worker between simulations reads the event and leaves
+    with its logs intact. One blocked on a lock its dead sibling was holding
+    never reaches that check, and only ending it frees the run.
+    """
+    with suppress(Exception):
+        error_event.set()
+    deadline = time() + grace_period
+    for worker in processes:
+        worker.join(timeout=max(0.0, deadline - time()))
+    for worker in processes:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=grace_period)
+
+
+def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECONDS):
+    """Wait for the workers, and stop waiting once one of them has died badly.
+
+    The lock the workers share belongs to the manager and is not released when
+    its holder is killed, so a sibling can block on a lock nobody owns while an
+    unbounded join waits with it. Nothing here bounds a run that is merely
+    slow: only an exit code says a worker has died.
+    """
+    while any(worker.is_alive() for worker in processes):
+        for worker in processes:
+            worker.join(timeout=_JOIN_POLL_SECONDS)
+        if any(_ended_badly(worker) for worker in processes):
+            _stop_the_workers_still_running(processes, error_event, grace_period)
+            return
 
 
 def _worker_failure_record(where, details):
