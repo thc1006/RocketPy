@@ -176,8 +176,9 @@ class StochasticRocket(StochasticModel):
             coordinate_system_orientation=None,
         )
 
-    # Nested stochastic objects, in spawn order. Append rather than reorder:
-    # the position of a name here addresses its collection's stream.
+    # Nested stochastic objects, in spawn order. A collection's stream is
+    # addressed by where its name falls in the two tuples read end to end, so
+    # appending to the first one moves every name in the second.
     _POSITIONED_COLLECTIONS = ("aerodynamic_surfaces", "motors", "rail_buttons")
     _PLAIN_COLLECTIONS = ("parachutes", "air_brakes")
 

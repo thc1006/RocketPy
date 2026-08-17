@@ -359,12 +359,14 @@ def test_seed_sequence_to_int_keeps_the_full_width():
     """
     root = np.random.SeedSequence(12345)
     a, b = root.spawn(2)
-    low = int(a.generate_state(4, dtype=np.uint32)[0])
+    words = a.generate_state(4, dtype=np.uint32)
+    # Every word, in one comparison. Asserting only that the high bits are not
+    # zero leaves a 64 or 96 bit truncation passing.
+    expected = sum(int(word) << (32 * at) for at, word in enumerate(words))
 
     seed = _seed_sequence_to_int(a)
 
-    assert seed >> 32, "everything above the first word was dropped"
-    assert seed & 0xFFFFFFFF == low
+    assert seed == expected
     assert seed.bit_length() <= 128
     assert seed != _seed_sequence_to_int(b)
     assert seed == _seed_sequence_to_int(a), "reading it twice moved the seed"
