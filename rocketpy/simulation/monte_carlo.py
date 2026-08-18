@@ -339,6 +339,20 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             number of workers will be equal to the number of CPUs available.
             A minimum of 2 workers is required for parallel mode.
             Default is None.
+        random_seed : int, sequence of int or numpy.random.SeedSequence, optional
+            Fixes what every simulation draws. Simulation ``i`` takes the same
+            inputs whichever way the run was split up, so serial and parallel
+            results agree and the number of workers does not reach the
+            sampling. Keyword-only. Default is None, which draws fresh entropy
+            and reproduces nothing.
+
+            Appending continues the same stream when the same seed is given
+            again, since an index maps to a seed and to nothing else. Nothing
+            here records the seed, so nothing here can tell you that a later
+            append was given the same one; that is #1075.
+
+            A ``Generator`` or ``BitGenerator`` is refused rather than read.
+            Pass the seed it was built from.
         kwargs : dict
             Custom arguments for simulation export of the ``inputs`` file. Options
             are:

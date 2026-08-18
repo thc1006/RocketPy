@@ -289,3 +289,11 @@ better reflecting the inherent uncertainties in rocketry.
 .. note::
     See the ``MonteCarlo`` class documentation for more information on how to run \
     Monte Carlo simulations with stochastic objects.
+
+.. note::
+    A whole run is fixed by ``MonteCarlo.simulate(random_seed=...)`` rather than
+    by seeding these models yourself. Each simulation takes its seed from its
+    own index, so simulation 7 draws the same inputs whether the run was serial
+    or split over any number of workers, and appending with the same seed
+    carries the same stream on. Without it a run draws fresh entropy and
+    reproduces nothing.
