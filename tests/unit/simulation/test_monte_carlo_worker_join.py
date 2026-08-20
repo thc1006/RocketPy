@@ -23,6 +23,10 @@ class _Worker:
 
     def join(self, timeout=None):  # pylint: disable=unused-argument
         self.joins += 1
+        # A real worker that never returns makes the caller hang, which is the
+        # bug. Reproducing that here would hang CI instead of reporting, so the
+        # stand-in gives up and says so.
+        assert self.joins < 200, "the join loop never stopped waiting"
         if self._never or self.joins <= self._alive_for:
             return
         self.exitcode = self._final_exitcode
@@ -33,11 +37,21 @@ class _Worker:
 
 
 class _Event:
-    def __init__(self):
-        self.was_set = False
+    def __init__(self, already_set=False):
+        self.was_set = already_set
+
+    def is_set(self):
+        return self.was_set
 
     def set(self):
         self.was_set = True
+
+
+class _BrokenEvent(_Event):
+    """A manager proxy that has gone away."""
+
+    def is_set(self):
+        raise OSError("the manager is gone")
 
 
 def test_a_run_where_every_worker_finishes_is_left_alone():
@@ -99,3 +113,33 @@ def test_a_slow_run_is_never_bounded():
 
     assert not any(worker.terminated for worker in (slow, slower))
     assert slower.joins > 50
+
+
+def test_a_reported_failure_also_stops_a_sibling_that_never_returns():
+    # A worker that fails the ordinary way is caught by the producer, reports
+    # through the event and returns, so it exits cleanly. Waiting only on exit
+    # codes leaves the parent sitting behind whichever sibling is stuck.
+    reported = _Worker(exitcode=0, alive_for=1)
+    stuck = _Worker(never=True)
+
+    _join_the_workers([reported, stuck], _Event(already_set=True), grace_period=0)
+
+    assert stuck.terminated
+
+
+def test_a_clean_run_is_not_stopped_by_an_event_nobody_set():
+    first, second = _Worker(alive_for=2), _Worker(alive_for=3)
+
+    _join_the_workers([first, second], _Event(), grace_period=0)
+
+    assert not any(worker.terminated for worker in (first, second))
+
+
+def test_an_event_that_cannot_be_read_does_not_stop_the_run():
+    # The control on the control. If asking the manager raises, that is not
+    # evidence of failure and must not end a healthy run.
+    first, second = _Worker(alive_for=2), _Worker(alive_for=3)
+
+    _join_the_workers([first, second], _BrokenEvent(), grace_period=0)
+
+    assert not any(worker.terminated for worker in (first, second))

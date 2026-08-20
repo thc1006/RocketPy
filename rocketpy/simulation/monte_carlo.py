@@ -501,15 +501,25 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                         "for more information."
                     )
 
+                # Last, and from the logs rather than from the workers: every
+                # check above reads how a process ended, and none of them can
+                # see a worker that left cleanly between claiming an index and
+                # recording it.
+                _refuse_a_run_that_lost_a_simulation(
+                    self.input_file, self.output_file, self.number_of_simulations
+                )
+
                 sim_monitor.print_final_status()
 
             # Handle error from the main process
             # pylint: disable=broad-except
             except (Exception, KeyboardInterrupt) as error:
-                simulation_error_event.set()
-
-                for sim_producer in processes:
-                    sim_producer.join()
+                # The same bounded teardown, which sets the event itself. An
+                # unbounded join here used to undo the bound above on exactly
+                # the stubborn worker it exists for.
+                _stop_the_workers_still_running(
+                    processes, simulation_error_event, _SHUTDOWN_GRACE_SECONDS
+                )
 
                 if not isinstance(error, KeyboardInterrupt):
                     raise error
@@ -1791,6 +1801,20 @@ def _ended_badly(worker):
     return worker.exitcode not in (None, 0)
 
 
+def _the_run_is_already_lost(processes, error_event):
+    """Whether anything says the run cannot finish.
+
+    A worker that fails the ordinary way reports through the event and returns,
+    so it exits cleanly and its exit code says nothing. Waiting only on exit
+    codes leaves the parent sitting behind a sibling that is stuck.
+    """
+    if any(_ended_badly(worker) for worker in processes):
+        return True
+    with suppress(Exception):
+        return bool(error_event.is_set())
+    return False
+
+
 def _stop_the_workers_still_running(processes, error_event, grace_period):
     """Ask the rest to stop, then end the ones that cannot.
 
@@ -1815,12 +1839,12 @@ def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECON
     The lock the workers share belongs to the manager and is not released when
     its holder is killed, so a sibling can block on a lock nobody owns while an
     unbounded join waits with it. Nothing here bounds a run that is merely
-    slow: only an exit code says a worker has died.
+    slow: only an exit code or a reported failure says a worker has given up.
     """
     while any(worker.is_alive() for worker in processes):
         for worker in processes:
             worker.join(timeout=_JOIN_POLL_SECONDS)
-        if any(_ended_badly(worker) for worker in processes):
+        if _the_run_is_already_lost(processes, error_event):
             _stop_the_workers_still_running(processes, error_event, grace_period)
             return
 
@@ -1832,6 +1856,59 @@ def _worker_failure_record(where, details):
     a worker printed is not there to be read once its output is redirected.
     """
     return json.dumps({"index": None, "stage": where, "error": details}) + "\n"
+
+
+def _indices_a_log_holds(path):
+    """Every index a log records, in order, and ``None`` for a row it cannot."""
+    found = []
+    with open(path, "r", encoding="utf-8") as recorded:
+        for line in recorded:
+            if not line.strip():
+                continue
+            try:
+                found.append(json.loads(line)["index"])
+            except (ValueError, KeyError, TypeError):
+                found.append(None)
+    return found
+
+
+def _refuse_a_run_that_lost_a_simulation(input_file, output_file, target):
+    """Raise unless both logs hold every simulation the run was asked for.
+
+    An exit code says how a worker ended, never whether the index it had
+    already claimed reached the logs, and the monitor counts claims rather than
+    rows. A worker that leaves between the two is invisible to everything else
+    here, so the logs themselves are what the run is judged on.
+    """
+    wanted = set(range(target))
+    for label, path in (("input", input_file), ("output", output_file)):
+        found = _indices_a_log_holds(path)
+        held = set(found)
+        if None in held:
+            raise RuntimeError(
+                f"The run is incomplete: the {label} log has rows that cannot "
+                f"be read, so what it holds cannot be established."
+            )
+        if len(found) != len(held):
+            raise RuntimeError(
+                f"The run is incomplete: the {label} log records "
+                f"{len(found) - len(held)} simulation(s) more than once."
+            )
+        if held != wanted:
+            missing = sorted(wanted - held)
+            extra = sorted(held - wanted)
+            trouble = []
+            if missing:
+                trouble.append(
+                    f"{len(missing)} of {target} are missing, the first "
+                    f"being {missing[0]}"
+                )
+            if extra:
+                trouble.append(f"{len(extra)} are numbered past the run")
+            raise RuntimeError(
+                f"The run is incomplete: the {label} log does not hold every "
+                f"simulation that was asked for, {' and '.join(trouble)}."
+            )
 
 
 def _refuse_a_worker_that_did_not_finish(processes):
