@@ -12,10 +12,30 @@ from rocketpy.simulation.monte_carlo import (
 )
 
 
+def _without_object_identity(value):
+    """The same record with every ``hash`` dropped, at any depth.
+
+    ``RocketPyEncoder`` records ``hash(obj)`` beside a serialized ``Function``,
+    and that is the object's identity in the process that wrote it, not
+    anything that was drawn. It agrees between two runs that share memory and
+    differs between two that do not, which is a property of the start method
+    rather than of the seed.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _without_object_identity(item)
+            for key, item in value.items()
+            if key != "hash"
+        }
+    if isinstance(value, list):
+        return [_without_object_identity(item) for item in value]
+    return value
+
+
 def _sampled_inputs(analysis):
     with open(analysis.input_file, "r", encoding="utf-8") as written:
         rows = [json.loads(line) for line in written if line.strip()]
-    return {row["index"]: row for row in rows}
+    return {row["index"]: _without_object_identity(row) for row in rows}
 
 
 def _a_run(tmp_path, stem, models, *, parallel=False, workers=None, seed=None, count=4):
