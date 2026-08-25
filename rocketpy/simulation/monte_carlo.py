@@ -44,6 +44,9 @@ from rocketpy.tools import (
 # this is the only format it can both resume from and overwrite safely.
 _SIMULATION_LOG_SUFFIX = ".txt"
 
+# Which simulation a row belongs to. Every check on a finished run reads it.
+_SIMULATION_INDEX_KEY = "index"
+
 
 def _refuse_logs_this_run_cannot_write(
     input_file, output_file, error_file, export_config=None
@@ -1027,6 +1030,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     raise ValueError(
                         "Invalid 'data_collector' key! "
                         f"Variable names overwrites 'export_list' key '{key}'."
+                    )
+                if key == _SIMULATION_INDEX_KEY:
+                    raise ValueError(
+                        f"Invalid 'data_collector' key '{key}'! It is the "
+                        f"number of the simulation the row belongs to, which "
+                        f"is written after the collectors run and cannot be "
+                        f"replaced by one."
                     )
                 if not callable(callback):
                     raise ValueError(

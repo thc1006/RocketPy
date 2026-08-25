@@ -142,3 +142,44 @@ def test_no_failure_path_waits_on_a_worker_without_a_bound():
     ]
 
     assert not unbounded, f"join() with no timeout at lines {unbounded}"
+
+
+def test_a_collector_cannot_take_over_the_simulation_index(
+    stochastic_environment, stochastic_calisto, stochastic_flight, tmp_path
+):
+    """A collector key called index is refused before the run touches a file."""
+    # Measured before this was refused: every row was written with the
+    # collector's value, so the log said 999 twice for a two-simulation run
+    # and every check that reads an index was reading the wrong thing.
+    # Refused when the collector is handed over, which is before any file
+    # is opened, rather than at the end of a run that is already spoilt.
+    with pytest.raises(ValueError, match="index"):
+        MonteCarlo(
+            filename=str(tmp_path / "study"),
+            environment=stochastic_environment,
+            rocket=stochastic_calisto,
+            flight=stochastic_flight,
+            data_collector={"index": lambda flight: 999},
+        )
+
+
+def test_a_collector_key_of_its_own_is_still_welcome(
+    stochastic_environment, stochastic_calisto, stochastic_flight, tmp_path
+):
+    """The control. Only the one reserved name is refused."""
+    analysis = MonteCarlo(
+        filename=str(tmp_path / "ok"),
+        environment=stochastic_environment,
+        rocket=stochastic_calisto,
+        flight=stochastic_flight,
+        data_collector={"apogee_twice": lambda flight: 2 * flight.apogee},
+    )
+
+    analysis.simulate(number_of_simulations=1, append=False)
+
+    with open(analysis.output_file, "r", encoding="utf-8") as written:
+        row = json.loads(next(line for line in written if line.strip()))
+    # Not the value of the index: how a run numbers its simulations is
+    # settled elsewhere, and pinning it here would tie this to that.
+    assert "index" in row
+    assert "apogee_twice" in row
