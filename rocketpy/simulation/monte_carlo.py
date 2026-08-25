@@ -47,6 +47,9 @@ _SIMULATION_LOG_SUFFIX = ".txt"
 # Which simulation a row belongs to. Every check on a finished run reads it.
 _SIMULATION_INDEX_KEY = "index"
 
+# How a manager that has gone away answers a proxy call.
+_MANAGER_IS_GONE = (OSError, EOFError)
+
 
 def _refuse_logs_this_run_cannot_write(
     input_file, output_file, error_file, export_config=None
@@ -612,16 +615,16 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         details = traceback.format_exc()
         where = "worker startup" if sim_idx is None else f"iteration {sim_idx}"
         announced = False
-        with suppress(Exception):
+        with suppress(_MANAGER_IS_GONE):
             error_event.set()
             announced = True
 
         mutex.acquire()
         try:
-            with suppress(Exception):
+            with suppress(OSError):
                 with open(self.error_file, "a", encoding="utf-8") as f:
                     f.write(inputs_json or _worker_failure_record(where, details))
-            with suppress(Exception):
+            with suppress(OSError, ValueError):
                 # Must use print() to remain visible from a worker process.
                 _SimMonitor.reprint(f"Error on {where}:\n{details}")
         finally:
@@ -1821,10 +1824,9 @@ def _ended_badly(worker):
 
 
 def _wait_for_the_workers(processes, seconds):
-    """Join every worker against one shared deadline, not one deadline each.
+    """Join every worker against one shared deadline, not one each.
 
-    ``monotonic`` rather than the wall clock, which a correction can move
-    underneath a shutdown already in progress.
+    Monotonic, since a clock correction would move a wall-clock deadline.
     """
     deadline = monotonic() + seconds
     for worker in processes:
@@ -1839,33 +1841,28 @@ def _stop_the_workers_still_running(processes, error_event, grace_period):
     never reaches that check. Terminate runs no handlers, so it comes second,
     and a worker can still ignore it.
     """
-    with suppress(Exception):
+    with suppress(_MANAGER_IS_GONE):
         error_event.set()
     _wait_for_the_workers(processes, grace_period)
 
     for worker in processes:
         if worker.is_alive():
-            with suppress(Exception):
-                worker.terminate()
+            worker.terminate()
     _wait_for_the_workers(processes, grace_period)
 
     for worker in processes:
         if worker.is_alive():
-            with suppress(Exception):
-                worker.kill()
+            worker.kill()
     _wait_for_the_workers(processes, grace_period)
 
 
 def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECONDS):
-    """Wait for the workers, and stop waiting once one of them has died badly.
+    """Wait for the workers, and stop once one of them has died badly.
 
-    The lock the workers share belongs to the manager and is not released when
-    its holder is killed, so a sibling can block on a lock nobody owns while an
-    unbounded join waits with it. Nothing here bounds a run that is merely
-    slow, and a reported failure does not either: a worker that reports has
-    left nothing behind, and its siblings stop of their own accord once they
-    finish the simulation in hand. Only a worker that died can hold the lock
-    for good.
+    The shared lock belongs to the manager and outlives a killed holder, so a
+    sibling can block on a lock nobody owns. Neither slowness nor a reported
+    failure ends the wait: a worker that reports leaves nothing behind, and
+    its siblings stop once they finish the simulation in hand.
     """
     while any(worker.is_alive() for worker in processes):
         for worker in processes:
@@ -1876,10 +1873,7 @@ def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECON
 
 
 def _worker_failure_record(where, details):
-    """A row for a worker that failed before it drew anything.
-
-    The caller is sent to this file, and a printed traceback is not in it.
-    """
+    """A row for a worker that failed before it drew anything."""
     return json.dumps({"index": None, "stage": where, "error": details}) + "\n"
 
 

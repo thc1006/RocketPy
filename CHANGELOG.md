@@ -60,6 +60,7 @@ Attention: The newest changes should be on top -->
 
 ### Fixed
 
+- BUG: Report a Monte Carlo worker that fails instead of hanging or passing for a finished run [#1182](https://github.com/RocketPy-Team/RocketPy/pull/1182)
 - BUG: Sample `StochasticFlight` inputs once per simulation [#1126](https://github.com/RocketPy-Team/RocketPy/pull/1126) [#1090](https://github.com/RocketPy-Team/RocketPy/issues/1090)
 - BUG: Fix spurious `ValueError` from floating-point roundoff at exact tank depletion [#1166](https://github.com/RocketPy-Team/RocketPy/pull/1166)
 - BUG: Draw each declared eccentricity once per simulation [#1168](https://github.com/RocketPy-Team/RocketPy/pull/1168)
