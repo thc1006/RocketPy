@@ -37,6 +37,17 @@ def test_a_run_that_recorded_everything_is_accepted(tmp_path):
     _refuse_logs_missing_a_simulation(inputs, outputs, 3)
 
 
+def test_blank_lines_between_rows_are_not_simulations(tmp_path):
+    """A blank line is skipped rather than counted as an unreadable row."""
+    # An interrupted write leaves them, and reading one as a row would report
+    # a damaged log for a run that lost nothing.
+    rows = [_row(0), "\n", _row(1), "   \n", _row(2)]
+    inputs = _a_log(tmp_path, "gappy.inputs.txt", rows)
+    outputs = _a_log(tmp_path, "gappy.outputs.txt", rows)
+
+    _refuse_logs_missing_a_simulation(inputs, outputs, 3)
+
+
 def test_a_missing_simulation_is_refused(tmp_path):
     """A gap in the output log names the first index that is missing."""
     inputs, outputs = _complete(tmp_path)
