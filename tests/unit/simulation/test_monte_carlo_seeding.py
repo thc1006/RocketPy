@@ -1,6 +1,7 @@
 import json
 import os
 
+import multiprocess
 import numpy as np
 import pytest
 
@@ -12,30 +13,32 @@ from rocketpy.simulation.monte_carlo import (
 )
 
 
-def _without_object_identity(value):
-    """The same record with every ``hash`` dropped, at any depth.
+def _what_was_drawn(value):
+    """The same record without the parts that say which process wrote it.
 
-    ``RocketPyEncoder`` records ``hash(obj)`` beside a serialized ``Function``,
-    and that is the object's identity in the process that wrote it, not
-    anything that was drawn. It agrees between two runs that share memory and
-    differs between two that do not, which is a property of the start method
-    rather than of the seed.
+    Two of the fields a serialized ``Function`` carries are properties of the
+    writer rather than of the draw. ``hash`` is the object's identity in that
+    process. A callable ``source`` is its pickle, and the same callable pickles
+    to different bytes under ``spawn``: measured on one drag curve, the parent
+    and a forked child agree and a spawned child does not, for a value the
+    fixture does not vary at all. Everything a run actually draws is numeric
+    and stays.
     """
     if isinstance(value, dict):
         return {
-            key: _without_object_identity(item)
+            key: _what_was_drawn(item)
             for key, item in value.items()
-            if key != "hash"
+            if key != "hash" and not (key == "source" and isinstance(item, str))
         }
     if isinstance(value, list):
-        return [_without_object_identity(item) for item in value]
+        return [_what_was_drawn(item) for item in value]
     return value
 
 
 def _sampled_inputs(analysis):
     with open(analysis.input_file, "r", encoding="utf-8") as written:
         rows = [json.loads(line) for line in written if line.strip()]
-    return {row["index"]: _without_object_identity(row) for row in rows}
+    return {row["index"]: _what_was_drawn(row) for row in rows}
 
 
 def _a_run(tmp_path, stem, models, *, parallel=False, workers=None, seed=None, count=4):
@@ -175,3 +178,30 @@ def test_an_appended_run_carries_the_same_stream_on(models, tmp_path):
     part.simulate(4, append=True, random_seed=42)
 
     assert _sampled_inputs(part) == _sampled_inputs(whole)
+
+
+@pytest.fixture(name="spawned_workers")
+def _spawned_workers():
+    """Start workers the way Windows does, wherever the test happens to run."""
+    was = multiprocess.get_start_method()
+    multiprocess.set_start_method("spawn", force=True)
+    yield
+    multiprocess.set_start_method(was, force=True)
+
+
+@pytest.mark.usefixtures("spawned_workers")
+@pytest.mark.skipif(os.cpu_count() < 4, reason="needs four workers to be four")
+def test_an_index_keeps_its_inputs_when_the_workers_are_spawned(models, tmp_path):
+    """The same guarantee on the start method Windows uses.
+
+    A spawned child rebuilds the models by unpickling rather than inheriting
+    them, so this is a different question from the one above and was worth
+    asking separately: the first version of these tests compared serialized
+    callables, which differ between processes for a value nothing varies.
+    """
+    serial = _a_run(tmp_path, "serial", models, seed=42)
+    two = _a_run(tmp_path, "two", models, parallel=True, workers=2, seed=42)
+    four = _a_run(tmp_path, "four", models, parallel=True, workers=4, seed=42)
+
+    assert _sampled_inputs(serial) == _sampled_inputs(two)
+    assert _sampled_inputs(serial) == _sampled_inputs(four)
