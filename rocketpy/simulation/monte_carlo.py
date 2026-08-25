@@ -46,6 +46,12 @@ from rocketpy.tools import (
 # this is the only format it can both resume from and overwrite safely.
 _SIMULATION_LOG_SUFFIX = ".txt"
 
+# Which root drew a row. An append reads it to continue the same stream.
+_SIMULATION_ROOT_KEY = "run_root"
+
+# Told apart from a row that carries ``None``, which no run writes.
+_NOTHING_READ_YET = object()
+
 
 def _root_seed_sequence(random_seed):
     """The immutable root a run derives every simulation's seed from.
@@ -65,6 +71,68 @@ def _root_seed_sequence(random_seed):
             f"built from."
         )
     return np.random.SeedSequence(random_seed)
+
+
+def _jsonable_entropy(entropy):
+    """``SeedSequence`` entropy as something ``json`` will take.
+
+    It may be an int, a sequence or an ndarray; only the first survives.
+    """
+    if entropy is None or isinstance(entropy, (int, np.integer)):
+        return None if entropy is None else int(entropy)
+    return [int(part) for part in np.asarray(entropy).ravel()]
+
+
+def _root_written_into_a_row(root_state):
+    """The run's root as one JSON value, carried by every input row.
+
+    In the rows because a file beside a log cannot be shown to belong to it.
+    """
+    entropy, spawn_key, pool_size, base = root_state
+    return {
+        "entropy": _jsonable_entropy(entropy),
+        "spawn_key": [int(key) for key in spawn_key],
+        "pool_size": int(pool_size),
+        "n_children_spawned": int(base),
+    }
+
+
+def _root_a_log_was_written_with(path):
+    """The root every row of a log agrees on, or ``None`` if it holds none.
+
+    ``None`` means the log holds no rows, and nothing else does. Rows that
+    carry no root are refused instead: they cannot be shown to be one study,
+    and reading them as an empty log would start a second one in the file.
+    A log whose rows disagree is refused for the same reason.
+    """
+    first = _NOTHING_READ_YET
+    with open(path, "r", encoding="utf-8") as recorded:
+        for line in recorded:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError as error:
+                raise ValueError(
+                    f"cannot continue {path}: a row cannot be read, so what "
+                    f"produced it cannot be established."
+                ) from error
+            if _SIMULATION_ROOT_KEY not in row:
+                raise ValueError(
+                    f"cannot continue {path}: a row does not say which root "
+                    f"drew it, which is how a study written before this "
+                    f"release looks. Start a new one rather than continuing "
+                    f"one whose rows cannot be checked."
+                )
+            root = row[_SIMULATION_ROOT_KEY]
+            if first is _NOTHING_READ_YET:
+                first = root
+            elif root != first:
+                raise ValueError(
+                    f"cannot continue {path}: its rows were not all drawn "
+                    f"from one root, so it holds more than one study."
+                )
+    return None if first is _NOTHING_READ_YET else first
 
 
 def _root_state_of(root):
@@ -392,11 +460,15 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # picklable values rather than as the object, since a worker rebuilds
         # any index from them.
         self.__root_state = _root_state_of(_root_seed_sequence(random_seed))
-
         # Before anything is opened: __setup_files truncates for append=False.
         _refuse_logs_this_run_cannot_write(
             self.input_file, self.output_file, self.error_file, kwargs
         )
+
+        # After that one, which says plainly that a .csv cannot be a working
+        # log. Reaching this first would report it as a row that cannot be read.
+        if append:
+            self.__continue_the_root_the_rows_carry(random_seed)
 
         print("Starting Monte Carlo analysis")
 
@@ -653,6 +725,33 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             error_event.set()
             mutex.release()
 
+    def __continue_the_root_the_rows_carry(self, random_seed):
+        """Take the root from the rows being appended to, or refuse to.
+
+        Without this an append draws a second root into one file and nothing
+        afterwards can tell which simulation came from which. Reading it back
+        also means a fresh object can continue a study, which is the ordinary
+        way of resuming one.
+        """
+        recorded = _root_a_log_was_written_with(self.input_file)
+        if recorded is None:
+            return
+        if random_seed is None:
+            self.__root_state = (
+                recorded["entropy"],
+                tuple(recorded["spawn_key"]),
+                recorded["pool_size"],
+                recorded["n_children_spawned"],
+            )
+            return
+        if _root_written_into_a_row(self.__root_state) != recorded:
+            raise ValueError(
+                f"cannot append to {self.input_file}: its rows were drawn from "
+                f"a different root than random_seed gives. Continuing would put "
+                f"two studies in one file. Pass the seed the run started with, "
+                f"or leave random_seed out to carry on from the rows."
+            )
+
     def __seed_this_simulation(self, sim_idx):
         """Reseed the three models from this index's own child of the root.
 
@@ -887,6 +986,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             for item in d.items()
         )
         inputs_dict["index"] = sim_idx
+        inputs_dict[_SIMULATION_ROOT_KEY] = _root_written_into_a_row(self.__root_state)
         return (
             json.dumps(inputs_dict, cls=RocketPyEncoder, **self._export_config) + "\n"
         )
