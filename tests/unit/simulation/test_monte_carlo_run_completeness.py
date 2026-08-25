@@ -8,7 +8,7 @@ import pytest
 from rocketpy.simulation import monte_carlo as mc_module
 from rocketpy.simulation.monte_carlo import (
     MonteCarlo,
-    _refuse_a_run_that_lost_a_simulation,
+    _refuse_logs_missing_a_simulation,
 )
 
 
@@ -31,49 +31,57 @@ def _complete(tmp_path, count=3, name="ok"):
 
 
 def test_a_run_that_recorded_everything_is_accepted(tmp_path):
+    """Logs holding every index the run asked for raise nothing."""
     inputs, outputs = _complete(tmp_path)
 
-    _refuse_a_run_that_lost_a_simulation(inputs, outputs, 3)
+    _refuse_logs_missing_a_simulation(inputs, outputs, 3)
 
 
 def test_a_missing_simulation_is_refused(tmp_path):
+    """A gap in the output log names the first index that is missing."""
     inputs, outputs = _complete(tmp_path)
     _a_log(tmp_path, "ok.outputs.txt", [_row(0), _row(2)])
 
     with pytest.raises(RuntimeError, match=r"output log.*missing.*being 1"):
-        _refuse_a_run_that_lost_a_simulation(inputs, outputs, 3)
+        _refuse_logs_missing_a_simulation(inputs, outputs, 3)
 
 
 def test_a_simulation_recorded_twice_is_refused(tmp_path):
+    """A duplicated index is refused, since a set alone would hide it."""
     inputs, outputs = _complete(tmp_path)
     _a_log(tmp_path, "ok.inputs.txt", [_row(0), _row(1), _row(1), _row(2)])
 
     with pytest.raises(RuntimeError, match="more than once"):
-        _refuse_a_run_that_lost_a_simulation(inputs, outputs, 3)
+        _refuse_logs_missing_a_simulation(inputs, outputs, 3)
 
 
 def test_a_row_that_cannot_be_read_is_refused(tmp_path):
+    """A torn row means the log's contents cannot be established."""
     inputs, outputs = _complete(tmp_path)
     _a_log(tmp_path, "ok.outputs.txt", [_row(0), "{half a row\n", _row(2)])
 
     with pytest.raises(RuntimeError, match="cannot be read"):
-        _refuse_a_run_that_lost_a_simulation(inputs, outputs, 3)
+        _refuse_logs_missing_a_simulation(inputs, outputs, 3)
 
 
-def test_a_row_numbered_past_the_run_is_refused(tmp_path):
-    inputs, outputs = _complete(tmp_path)
-    _a_log(tmp_path, "ok.inputs.txt", [_row(0), _row(1), _row(2), _row(9)])
+def test_rows_numbered_past_the_run_are_left_alone(tmp_path):
+    """An append below what a checkpoint already holds loses no simulation."""
+    # Refusing these said rows were missing when they were extra, and moved
+    # what append means inside a change about worker failure.
+    rows = [_row(index) for index in range(4)]
+    inputs = _a_log(tmp_path, "big.inputs.txt", rows)
+    outputs = _a_log(tmp_path, "big.outputs.txt", rows)
 
-    with pytest.raises(RuntimeError, match="past the run"):
-        _refuse_a_run_that_lost_a_simulation(inputs, outputs, 3)
+    _refuse_logs_missing_a_simulation(inputs, outputs, 2)
 
 
 def test_logs_that_hold_different_simulations_are_refused(tmp_path):
+    """The input and output logs have to hold the same indices."""
     inputs = _a_log(tmp_path, "a.inputs.txt", [_row(0), _row(1)])
     outputs = _a_log(tmp_path, "a.outputs.txt", [_row(0), _row(2)])
 
     with pytest.raises(RuntimeError):
-        _refuse_a_run_that_lost_a_simulation(inputs, outputs, 2)
+        _refuse_logs_missing_a_simulation(inputs, outputs, 2)
 
 
 def _leave_cleanly_without_recording(_flight):
@@ -85,6 +93,7 @@ def _leave_cleanly_without_recording(_flight):
 def test_a_worker_that_leaves_cleanly_without_recording_is_not_a_success(
     stochastic_environment, stochastic_calisto, stochastic_flight, tmp_path
 ):
+    """A zero exit with no row written makes ``simulate`` raise."""
     analysis = MonteCarlo(
         filename=str(tmp_path / "study"),
         environment=stochastic_environment,
@@ -100,6 +109,7 @@ def test_a_worker_that_leaves_cleanly_without_recording_is_not_a_success(
 
 
 def test_no_failure_path_waits_on_a_worker_without_a_bound():
+    """No ``join`` in the parallel path is called without a timeout."""
     # An unbounded join anywhere in the parallel path puts back the hang that
     # the bounded teardown exists to end, and it does so where it is hardest
     # to notice: only when a worker is already stuck.

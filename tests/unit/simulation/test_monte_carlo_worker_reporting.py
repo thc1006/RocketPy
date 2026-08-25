@@ -1,5 +1,6 @@
 import json
 import os
+from contextlib import suppress
 from types import SimpleNamespace
 
 import pytest
@@ -68,6 +69,7 @@ def _run(study, monitor, error_event, mutex=None):
 
 
 def test_a_worker_that_fails_before_seeding_finishes_says_so(tmp_path, capsys):
+    """A failure above the loop is reported against worker startup."""
     monitor = SimpleNamespace(keep_simulating=lambda: True)
     study, error_event = _a_worker(tmp_path, _refusing_model())
 
@@ -80,6 +82,8 @@ def test_a_worker_that_fails_before_seeding_finishes_says_so(tmp_path, capsys):
 
 
 def test_a_worker_that_fails_before_claiming_an_index_says_so(tmp_path, capsys):
+    """A failed claim is startup too, since no index was taken."""
+
     def refuse():
         raise RuntimeError("the monitor would not hand out an index")
 
@@ -96,6 +100,8 @@ def test_a_worker_that_fails_before_claiming_an_index_says_so(tmp_path, capsys):
 def test_a_worker_that_fails_inside_a_simulation_names_the_index(
     tmp_path, capsys, monkeypatch
 ):
+    """A failure after a claim is reported against that index."""
+
     # The control. An index is claimed and the simulation then fails, which is
     # the path that already worked, so the report still has to name it.
     def refuse(_self):
@@ -115,6 +121,7 @@ def test_a_worker_that_fails_inside_a_simulation_names_the_index(
 
 
 def test_a_startup_failure_is_written_down_and_not_only_printed(tmp_path):
+    """The error log gets a row even when no inputs were drawn."""
     # The caller is told to read the error file, and a traceback the worker
     # printed is not there to be read once its output has been redirected.
     monitor = SimpleNamespace(keep_simulating=lambda: True)
@@ -132,6 +139,8 @@ def test_a_startup_failure_is_written_down_and_not_only_printed(tmp_path):
 
 @pytest.mark.parametrize("failing", ["_set_stochastic", "increment"])
 def test_a_worker_failure_never_raises_out_of_the_producer(tmp_path, failing):
+    """A reported failure leaves the producer without an exception."""
+
     # The handler used to reach for names the loop had not bound yet, so the
     # process died with UnboundLocalError and the parent waited forever.
     def refuse(*_args):
@@ -154,6 +163,7 @@ def test_a_worker_failure_never_raises_out_of_the_producer(tmp_path, failing):
 
 @pytest.mark.parametrize("breaking", ["error_file", "reprint", "event"])
 def test_reporting_a_failure_never_keeps_the_mutex(tmp_path, monkeypatch, breaking):
+    """The manager lock is released however the reporting goes."""
     # The mutex is the manager's, so a worker that ends while holding it leaves
     # the next one waiting on a process that is gone, and the parent never
     # reaches the join that would have noticed.
@@ -168,8 +178,13 @@ def test_reporting_a_failure_never_keeps_the_mutex(tmp_path, monkeypatch, breaki
     event = _ErrorEvent(refuse=breaking == "event")
     monitor = SimpleNamespace(keep_simulating=lambda: True)
     study, error_event = _a_worker(tmp_path, _refusing_model(), event)
+    mutex = _Mutex()
 
-    mutex = _run(study, monitor, error_event)
+    # A worker that could not announce its failure re-raises on the way out, so
+    # that its exit code carries what the event could not. The lock still has
+    # to be back either way, which is what this is about.
+    with suppress(RuntimeError):
+        _run(study, monitor, error_event, mutex)
 
     assert mutex.acquired == 1
     assert not mutex.held
@@ -178,6 +193,7 @@ def test_reporting_a_failure_never_keeps_the_mutex(tmp_path, monkeypatch, breaki
 def test_a_reporting_failure_does_not_replace_the_simulation_failure(
     tmp_path, monkeypatch, capsys
 ):
+    """An unwritable log does not hide what actually failed."""
     monkeypatch.setattr(mc_module, "_worker_failure_record", _raise_instead("no disk"))
     monitor = SimpleNamespace(keep_simulating=lambda: True)
     study, error_event = _a_worker(tmp_path, _refusing_model())
@@ -187,3 +203,90 @@ def test_a_reporting_failure_does_not_replace_the_simulation_failure(
     assert error_event.was_set
     assert "the models would not reseed" in capsys.readouterr().out
     assert not os.path.getsize(study.error_file)
+
+
+def _committing_producer(monkeypatch):
+    """Make one simulation run start to finish without a real flight."""
+    monkeypatch.setattr(
+        MonteCarlo, "_MonteCarlo__run_single_simulation", lambda self: None
+    )
+    monkeypatch.setattr(
+        MonteCarlo,
+        "_MonteCarlo__evaluate_flight_inputs",
+        lambda self, index: json.dumps({"index": index, "committed": True}) + "\n",
+    )
+    monkeypatch.setattr(
+        MonteCarlo,
+        "_MonteCarlo__evaluate_flight_outputs",
+        lambda self, flight, index: json.dumps({"index": index}) + "\n",
+    )
+
+
+def _one_then_broken():
+    calls = {"count": 0}
+
+    def keep_simulating():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return True
+        raise RuntimeError("the monitor died between simulations")
+
+    return SimpleNamespace(
+        keep_simulating=keep_simulating,
+        increment=lambda: 1,
+        print_update_status=lambda: None,
+    )
+
+
+def test_a_failure_between_simulations_is_not_blamed_on_the_last_one(
+    tmp_path, capsys, monkeypatch
+):
+    """A failure after a committed row is not reported against it."""
+    # Simulation 0 finishes and its row is committed. The next claim then
+    # fails, which is not simulation 0's doing and must not be recorded as it.
+    _committing_producer(monkeypatch)
+    model = SimpleNamespace(last_rnd_dict={}, _set_stochastic=lambda _seed: None)
+    study, error_event = _a_worker(tmp_path, model)
+
+    _run(study, _one_then_broken(), error_event)
+
+    assert "worker startup" in capsys.readouterr().out
+
+
+def test_a_committed_row_is_not_written_to_the_error_log_as_well(tmp_path, monkeypatch):
+    """A row that succeeded appears in one log, not in both."""
+    _committing_producer(monkeypatch)
+    model = SimpleNamespace(last_rnd_dict={}, _set_stochastic=lambda _seed: None)
+    study, error_event = _a_worker(tmp_path, model)
+
+    _run(study, _one_then_broken(), error_event)
+
+    with open(study.output_file, "r", encoding="utf-8") as written:
+        committed = [json.loads(line) for line in written if line.strip()]
+    with open(study.error_file, "r", encoding="utf-8") as recorded:
+        errored = [json.loads(line) for line in recorded if line.strip()]
+
+    assert committed == [{"index": 0}]
+    assert all(row.get("committed") is None for row in errored)
+
+
+def test_a_worker_that_cannot_announce_its_failure_does_not_exit_cleanly(tmp_path):
+    """With the event unreachable the producer raises, so the exit is not zero."""
+    # The event is how a worker reaches the parent. With it unreachable, the
+    # only signal left is how the process ends, so it must not end well.
+    model = _refusing_model()
+    study, error_event = _a_worker(tmp_path, model, _ErrorEvent(refuse=True))
+
+    with pytest.raises(RuntimeError, match="the models would not reseed"):
+        _run(study, SimpleNamespace(keep_simulating=lambda: True), error_event)
+
+
+def test_a_worker_that_did_announce_its_failure_returns(tmp_path):
+    """With the event delivered the producer returns on purpose."""
+    # The control. With the event delivered the parent already knows, so the
+    # producer returns and the process exits cleanly on purpose.
+    study, error_event = _a_worker(tmp_path, _refusing_model())
+
+    _run(study, SimpleNamespace(keep_simulating=lambda: True), error_event)
+
+    assert error_event.was_set
