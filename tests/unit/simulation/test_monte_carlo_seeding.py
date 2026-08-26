@@ -1,5 +1,6 @@
 import json
 import os
+from time import time
 
 import multiprocess
 import numpy as np
@@ -10,6 +11,7 @@ from rocketpy.simulation.monte_carlo import (
     _root_seed_sequence,
     _root_state_of,
     _seed_of_simulation,
+    _SimMonitor,
 )
 
 
@@ -205,3 +207,46 @@ def test_an_index_keeps_its_inputs_when_the_workers_are_spawned(models, tmp_path
 
     assert _sampled_inputs(serial) == _sampled_inputs(two)
     assert _sampled_inputs(serial) == _sampled_inputs(four)
+
+
+class _ALockNobodyContends:
+    """The manager's mutex, with only this process to hand it to."""
+
+    def acquire(self):
+        pass
+
+    def release(self):
+        pass
+
+
+class _AnEventNobodySet:
+    """The failure event, which nothing in a clean run reaches for."""
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        raise AssertionError("the producer reported a failure")
+
+
+def test_a_worker_loop_draws_the_study_serial_draws(models, tmp_path):
+    """The loop a worker runs, driven here, produces the run serial produces."""
+    # Every other check of this starts a child process, where the same code
+    # runs and nothing in the test can watch it.
+    serial = _a_run(tmp_path, "serial", models, seed=42, count=4)
+    environment, rocket, flight = models
+    worker = MonteCarlo(
+        filename=str(tmp_path / "worker"),
+        environment=environment,
+        rocket=rocket,
+        flight=flight,
+    )
+    worker.simulate(number_of_simulations=0, append=False, random_seed=42)
+
+    worker._MonteCarlo__sim_producer(
+        _SimMonitor(initial_count=0, n_simulations=4, start_time=time()),
+        _ALockNobodyContends(),
+        _AnEventNobodySet(),
+    )
+
+    assert _sampled_inputs(worker) == _sampled_inputs(serial)
