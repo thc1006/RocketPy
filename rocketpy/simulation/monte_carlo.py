@@ -415,10 +415,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             sampling. Keyword-only. Default is None, which draws fresh entropy
             and reproduces nothing.
 
-            Appending continues the same stream when the same seed is given
-            again, since an index maps to a seed and to nothing else. Nothing
-            here records the seed, so nothing here can tell you that a later
-            append was given the same one; that is #1075.
+            Every input row carries the root it was drawn from, so an append
+            carries on from the study already in the file whether or not the
+            seed is given again. A different one is refused, not mixed in.
 
             A ``Generator`` or ``BitGenerator`` is refused rather than read.
             Pass the seed it was built from.

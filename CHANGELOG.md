@@ -32,6 +32,7 @@ Attention: The newest changes should be on top -->
 
 ### Added
 
+- ENH: Continue a Monte Carlo study from the root its rows were drawn with [#1187](https://github.com/RocketPy-Team/RocketPy/pull/1187) [#1075](https://github.com/RocketPy-Team/RocketPy/issues/1075)
 - ENH: Reproducible Monte Carlo through per-simulation-index seeding [#1054](https://github.com/RocketPy-Team/RocketPy/pull/1054) [#1053](https://github.com/RocketPy-Team/RocketPy/issues/1053)
 - ENH: Support fixed-time parachute deployment triggers [#1133](https://github.com/RocketPy-Team/RocketPy/pull/1133) [#437](https://github.com/RocketPy-Team/RocketPy/issues/437)
 - DOC: Add SIL parachute ejection integration example [#1131](https://github.com/RocketPy-Team/RocketPy/pull/1131) [#524](https://github.com/RocketPy-Team/RocketPy/issues/524)
