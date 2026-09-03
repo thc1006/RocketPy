@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from rocketpy.simulation.monte_carlo import MonteCarlo, _SIMULATION_ROOT_KEY
+from rocketpy.simulation.monte_carlo import (
+    MonteCarlo,
+    _root_digest,
+    _SIMULATION_ROOT_KEY,
+)
 
 
 def _study(tmp_path, stem, models):
@@ -112,6 +116,76 @@ def test_a_log_whose_rows_carry_no_root_is_refused(models, tmp_path):
         analysis.simulate(4, append=True)
 
 
+def _rewrite(path, replacement):
+    """Put ``replacement`` under the root key of every row of one log."""
+    with open(path, "r", encoding="utf-8") as written:
+        rows = [json.loads(line) for line in written if line.strip()]
+    for row in rows:
+        row[_SIMULATION_ROOT_KEY] = replacement(row[_SIMULATION_ROOT_KEY])
+    with open(path, "w", encoding="utf-8") as rewritten:
+        for row in rows:
+            rewritten.write(json.dumps(row) + "\n")
+
+
+def _rewrite_roots(analysis, damage):
+    """Damage the recorded root, leaving the two logs still naming one study.
+
+    The output rows hold the root's digest, so they are restamped rather than
+    damaged: otherwise the two logs disagree and that is refused first.
+    """
+    with open(analysis.input_file, "r", encoding="utf-8") as written:
+        first = json.loads(next(line for line in written if line.strip()))
+    damaged = damage(first[_SIMULATION_ROOT_KEY])
+    _rewrite(analysis.input_file, lambda _root: damaged)
+    if isinstance(damaged, dict):
+        _rewrite(analysis.output_file, lambda _digest: _root_digest(damaged))
+
+
+def test_a_log_whose_root_is_null_is_refused(models, tmp_path):
+    """A null root is no more of a lineage than no root at all."""
+    # It read as an empty log, so an append started a second root behind the
+    # damaged rows, which is the case this check exists to prevent.
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+
+    _rewrite_roots(analysis, lambda root: None)
+
+    with pytest.raises(ValueError, match="does not say which root"):
+        analysis.simulate(4, append=True)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda root: {**root, "entropy": None},
+        lambda root: {**root, "pool_size": 0},
+        lambda root: {**root, "pool_size": 2},
+        lambda root: {**root, "n_children_spawned": -1},
+        lambda root: {**root, "spawn_key": [True]},
+        lambda root: {key: value for key, value in root.items() if key != "entropy"},
+        lambda root: {**root, "unexpected": 1},
+    ],
+    ids=[
+        "null entropy",
+        "no pool",
+        "pool numpy refuses",
+        "negative base",
+        "bool key",
+        "short",
+        "long",
+    ],
+)
+def test_a_root_that_no_stream_can_be_rebuilt_from_is_refused(models, tmp_path, damage):
+    """Rows agreeing on a root does not make it a root that can be resumed."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+
+    _rewrite_roots(analysis, damage)
+
+    with pytest.raises(ValueError, match="rebuilt from"):
+        analysis.simulate(4, append=True)
+
+
 def test_an_empty_log_is_not_a_log_that_cannot_be_checked(models, tmp_path):
     """The control. Nothing recorded yet is a fresh start, not a refusal."""
     analysis = _study(tmp_path, "study", models)
@@ -168,3 +242,50 @@ def test_a_row_that_cannot_be_read_is_refused(models, tmp_path):
 
     with pytest.raises(ValueError, match="cannot be read"):
         analysis.simulate(4, append=True)
+
+
+def test_an_output_log_from_another_study_is_refused(models, tmp_path):
+    """Matching indices do not make two files the two halves of one run."""
+    # Nothing in the indices tells them apart: both studies number their rows
+    # from zero, so the root is what says they belong together.
+    one = _study(tmp_path, "one", models)
+    one.simulate(2, append=False, random_seed=42)
+    other = _study(tmp_path, "other", models)
+    other.simulate(2, append=False, random_seed=7)
+    with open(other.output_file, "r", encoding="utf-8") as theirs:
+        stolen = theirs.read()
+    with open(one.output_file, "w", encoding="utf-8") as ours:
+        ours.write(stolen)
+
+    with pytest.raises(ValueError, match="same root"):
+        one.simulate(4, append=True)
+
+
+def test_a_checkpoint_whose_halves_disagree_is_refused(models, tmp_path):
+    """Where to carry on from is not established by one log alone."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+    with open(analysis.output_file, "r", encoding="utf-8") as written:
+        rows = [line for line in written if line.strip()]
+    with open(analysis.output_file, "w", encoding="utf-8") as trimmed:
+        trimmed.write(rows[0])
+
+    with pytest.raises(ValueError, match="different numbers of rows"):
+        analysis.simulate(4, append=True)
+
+
+def test_a_collector_cannot_take_over_the_root(models, tmp_path):
+    """The root binds the two logs, so nothing outside the run writes it."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.data_collector = {_SIMULATION_ROOT_KEY: lambda _flight: "forged"}
+
+    analysis.simulate(2, append=False, random_seed=42)
+
+    with open(analysis.output_file, "r", encoding="utf-8") as written:
+        roots = {
+            json.dumps(json.loads(line)[_SIMULATION_ROOT_KEY], sort_keys=True)
+            for line in written
+            if line.strip()
+        }
+    assert roots != {'"forged"'}
+    assert len(roots) == 1

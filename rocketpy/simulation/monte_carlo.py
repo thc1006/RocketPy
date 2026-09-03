@@ -14,6 +14,7 @@ latest documentation.
 """
 
 import csv
+import hashlib
 import json
 import os
 import threading
@@ -97,8 +98,75 @@ def _root_written_into_a_row(root_state):
     }
 
 
-def _root_a_log_was_written_with(path):
-    """The root every row of a log agrees on, or ``None`` if it holds none.
+_ROOT_FIELDS = frozenset(("entropy", "spawn_key", "pool_size", "n_children_spawned"))
+
+
+def _root_digest(root):
+    """A short stable name for a root, for rows that only have to match one.
+
+    Carried by the output rows instead of the root itself, which would cost a
+    hundred bytes a row on a study the input log already records it for.
+    """
+    canonical = json.dumps(root, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _a_whole_number(value):
+    """A non-negative int, and not a bool standing in for one."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _whole_numbers(value, may_be_empty=False):
+    """A list of non-negative ints, empty only where that is a valid one."""
+    return (
+        isinstance(value, list)
+        and (may_be_empty or len(value) > 0)
+        and all(_a_whole_number(part) for part in value)
+    )
+
+
+def _root_state_a_row_records(root, path):
+    """The four values a root is rebuilt from, refused unless all are usable.
+
+    Agreeing rows show the study is one study, not that what they agree on can
+    be resumed: ``SeedSequence(entropy=None)`` draws fresh entropy every time.
+    """
+    entropy = root.get("entropy") if isinstance(root, dict) else None
+    usable = (
+        isinstance(root, dict)
+        and set(root) == _ROOT_FIELDS
+        and (_a_whole_number(entropy) or _whole_numbers(entropy))
+        and _whole_numbers(root.get("spawn_key"), may_be_empty=True)
+        and _a_whole_number(root.get("pool_size"))
+        and _a_whole_number(root.get("n_children_spawned"))
+    )
+    if usable:
+        state = (
+            entropy,
+            tuple(root["spawn_key"]),
+            root["pool_size"],
+            root["n_children_spawned"],
+        )
+        try:
+            # Drawing one child is what proves the pool size numpy will take.
+            _seed_of_simulation(state, 0)
+            return state
+        except ValueError:
+            pass
+    raise ValueError(
+        f"cannot continue {path}: its rows record a root that no stream "
+        f"can be rebuilt from, so what they were drawn with is unknown."
+    )
+
+
+def _rows_a_log_holds(path):
+    """How many simulations a log records, blank lines aside."""
+    with open(path, "r", encoding="utf-8") as recorded:
+        return sum(1 for line in recorded if line.strip())
+
+
+def _what_the_rows_say_drew_them(path):
+    """What every row of a log agrees drew it, or ``None`` if it holds none.
 
     ``None`` means the log holds no rows, and nothing else does. Rows that
     carry no root are refused instead: they cannot be shown to be one study,
@@ -117,14 +185,14 @@ def _root_a_log_was_written_with(path):
                     f"cannot continue {path}: a row cannot be read, so what "
                     f"produced it cannot be established."
                 ) from error
-            if _SIMULATION_ROOT_KEY not in row:
+            root = row.get(_SIMULATION_ROOT_KEY) if isinstance(row, dict) else None
+            if root is None:
                 raise ValueError(
                     f"cannot continue {path}: a row does not say which root "
                     f"drew it, which is how a study written before this "
                     f"release looks. Start a new one rather than continuing "
                     f"one whose rows cannot be checked."
                 )
-            root = row[_SIMULATION_ROOT_KEY]
             if first is _NOTHING_READ_YET:
                 first = root
             elif root != first:
@@ -732,16 +800,27 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         also means a fresh object can continue a study, which is the ordinary
         way of resuming one.
         """
-        recorded = _root_a_log_was_written_with(self.input_file)
+        recorded = _what_the_rows_say_drew_them(self.input_file)
+        stamped = _what_the_rows_say_drew_them(self.output_file)
+        named = None if recorded is None else _root_digest(recorded)
+        if named != stamped:
+            raise ValueError(
+                f"cannot append to {self.input_file}: it and {self.output_file} "
+                f"were not drawn from the same root, so they are two studies "
+                f"rather than the two halves of one."
+            )
         if recorded is None:
             return
-        if random_seed is None:
-            self.__root_state = (
-                recorded["entropy"],
-                tuple(recorded["spawn_key"]),
-                recorded["pool_size"],
-                recorded["n_children_spawned"],
+        held = _rows_a_log_holds(self.input_file)
+        if held != _rows_a_log_holds(self.output_file):
+            raise ValueError(
+                f"cannot append to {self.input_file}: it and {self.output_file} "
+                f"hold different numbers of rows, so where to carry on from "
+                f"cannot be established."
             )
+        state = _root_state_a_row_records(recorded, self.input_file)
+        if random_seed is None:
+            self.__root_state = state
             return
         if _root_written_into_a_row(self.__root_state) != recorded:
             raise ValueError(
@@ -1020,8 +1099,11 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     ) from e
             outputs_dict = outputs_dict | additional_exports
 
-        # After the collectors, so one cannot take the row's own number.
+        # After the collectors: these two say which run the row belongs to.
         outputs_dict["index"] = sim_idx
+        outputs_dict[_SIMULATION_ROOT_KEY] = _root_digest(
+            _root_written_into_a_row(self.__root_state)
+        )
 
         return (
             json.dumps(outputs_dict, cls=RocketPyEncoder, **self._export_config) + "\n"
