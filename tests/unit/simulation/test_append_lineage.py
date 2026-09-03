@@ -270,12 +270,13 @@ def test_a_checkpoint_whose_halves_disagree_is_refused(models, tmp_path):
     with open(analysis.output_file, "w", encoding="utf-8") as trimmed:
         trimmed.write(rows[0])
 
-    with pytest.raises(ValueError, match="different numbers of rows"):
+    with pytest.raises(ValueError, match="do not record the same simulations"):
         analysis.simulate(4, append=True)
 
 
 def test_a_collector_cannot_take_over_the_root(models, tmp_path):
     """The root binds the two logs, so nothing outside the run writes it."""
+    # Set past the constructor, so this pins the row and not the validation.
     analysis = _study(tmp_path, "study", models)
     analysis.data_collector = {_SIMULATION_ROOT_KEY: lambda _flight: "forged"}
 
@@ -289,3 +290,102 @@ def test_a_collector_cannot_take_over_the_root(models, tmp_path):
         }
     assert roots != {'"forged"'}
     assert len(roots) == 1
+
+
+def test_a_collector_named_after_the_root_is_refused(models, tmp_path):
+    """Overwriting it afterwards protects the log but discards the callback."""
+    with pytest.raises(ValueError, match="run after the collectors|discarded"):
+        MonteCarlo(
+            filename=str(tmp_path / "study"),
+            environment=models[0],
+            rocket=models[1],
+            flight=models[2],
+            data_collector={_SIMULATION_ROOT_KEY: lambda _flight: 1},
+        )
+
+
+def _rows_of(path):
+    with open(path, "r", encoding="utf-8") as written:
+        return [line for line in written if line.strip()]
+
+
+def _rewrite_indices(path, numbers):
+    """Renumber a log's rows, leaving everything else in them alone."""
+    rows = [json.loads(line) for line in _rows_of(path)]
+    for row, number in zip(rows, numbers):
+        row["index"] = number
+    with open(path, "w", encoding="utf-8") as rewritten:
+        for row in rows:
+            rewritten.write(json.dumps(row) + "\n")
+
+
+def test_a_blank_line_in_the_output_log_does_not_move_the_continuation(
+    models, tmp_path
+):
+    """Where to carry on from comes from the records, not the line count."""
+    # A fresh object counts physical output lines when it opens the file, so
+    # one blank line made an append start at 3 and leave index 2 missing.
+    written = _study(tmp_path, "study", models)
+    written.simulate(2, append=False, random_seed=42)
+    with open(written.output_file, "a", encoding="utf-8") as padded:
+        padded.write("\n")
+
+    resumed = _study(tmp_path, "study", models)
+    assert resumed.num_of_loaded_sims == 3  # the count this must not trust
+    resumed.simulate(4, append=True)
+
+    assert sorted(_drawn(resumed)) == [0, 1, 2, 3]
+
+
+def test_halves_that_number_the_same_count_differently_are_refused(models, tmp_path):
+    """Equal row counts do not make two logs the two halves of one run."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+    _rewrite_indices(analysis.output_file, [0, 2])
+
+    with pytest.raises(ValueError, match="do not record the same simulations"):
+        analysis.simulate(4, append=True)
+
+
+@pytest.mark.parametrize(
+    "numbers", [[0, 0], [0, 2], [1, 2]], ids=["duplicate", "hole", "no zero"]
+)
+def test_a_checkpoint_that_is_not_the_runs_first_simulations_is_refused(
+    models, tmp_path, numbers
+):
+    """An append continues a run, so what it continues has to be its start."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+    for path in (analysis.input_file, analysis.output_file):
+        _rewrite_indices(path, numbers)
+
+    with pytest.raises(ValueError, match="not the run's first"):
+        analysis.simulate(4, append=True)
+
+
+def test_the_order_a_parallel_run_finished_in_is_carried_on_from(models, tmp_path):
+    """Rows arrive in completion order, which is not sorted and not wrong."""
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+    for path in (analysis.input_file, analysis.output_file):
+        _rewrite_indices(path, [1, 0])
+
+    analysis.simulate(4, append=True)
+
+    assert sorted(_drawn(analysis)) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "number", [True, 1.0, "1", None, -1], ids=["bool", "float", "str", "null", "neg"]
+)
+def test_a_row_that_does_not_number_its_simulation_is_refused(models, tmp_path, number):
+    """Only a non-negative int says which simulation a row holds."""
+    # True and 1.0 both equal 1, so either would pass for a record that is not
+    # there, and the count they contribute to decides where an append starts.
+    analysis = _study(tmp_path, "study", models)
+    analysis.simulate(2, append=False, random_seed=42)
+    for path in (analysis.input_file, analysis.output_file):
+        _rewrite_indices(path, [0, number])
+
+    with pytest.raises(ValueError, match="does not number"):
+        analysis.simulate(4, append=True)

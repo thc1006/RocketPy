@@ -104,8 +104,9 @@ _ROOT_FIELDS = frozenset(("entropy", "spawn_key", "pool_size", "n_children_spawn
 def _root_digest(root):
     """A short stable name for a root, for rows that only have to match one.
 
-    Carried by the output rows instead of the root itself, which would cost a
-    hundred bytes a row on a study the input log already records it for.
+    64 bits of SHA-256, carried by the output rows instead of the root itself,
+    which would cost a hundred bytes a row on a study the input log already
+    records it for. Wide enough to tell studies apart, not a signature.
     """
     canonical = json.dumps(root, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -159,14 +160,10 @@ def _root_state_a_row_records(root, path):
     )
 
 
-def _rows_a_log_holds(path):
-    """How many simulations a log records, blank lines aside."""
-    with open(path, "r", encoding="utf-8") as recorded:
-        return sum(1 for line in recorded if line.strip())
-
-
 def _what_the_rows_say_drew_them(path):
-    """What every row of a log agrees drew it, or ``None`` if it holds none.
+    """What every row agrees drew it, and the simulations it numbers.
+
+    ``(None, [])`` means the log holds no rows, and nothing else does.
 
     ``None`` means the log holds no rows, and nothing else does. Rows that
     carry no root are refused instead: they cannot be shown to be one study,
@@ -174,6 +171,7 @@ def _what_the_rows_say_drew_them(path):
     A log whose rows disagree is refused for the same reason.
     """
     first = _NOTHING_READ_YET
+    numbered = []
     with open(path, "r", encoding="utf-8") as recorded:
         for line in recorded:
             if not line.strip():
@@ -193,6 +191,14 @@ def _what_the_rows_say_drew_them(path):
                     f"release looks. Start a new one rather than continuing "
                     f"one whose rows cannot be checked."
                 )
+            index = row.get("index")
+            if not _a_whole_number(index):
+                raise ValueError(
+                    f"cannot continue {path}: a row does not number the "
+                    f"simulation it holds, so where to carry on from cannot "
+                    f"be established."
+                )
+            numbered.append(index)
             if first is _NOTHING_READ_YET:
                 first = root
             elif root != first:
@@ -200,7 +206,7 @@ def _what_the_rows_say_drew_them(path):
                     f"cannot continue {path}: its rows were not all drawn "
                     f"from one root, so it holds more than one study."
                 )
-    return None if first is _NOTHING_READ_YET else first
+    return (None if first is _NOTHING_READ_YET else first), numbered
 
 
 def _root_state_of(root):
@@ -521,7 +527,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         """
         self._export_config = kwargs
         self.number_of_simulations = number_of_simulations
-        self._initial_sim_idx = self.num_of_loaded_sims if append else 0
+        self._initial_sim_idx = 0
         # Validated here, before __setup_files truncates anything, so an
         # unusable seed cannot cost a previous run its results. Kept as four
         # picklable values rather than as the object, since a worker rebuilds
@@ -535,7 +541,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         # After that one, which says plainly that a .csv cannot be a working
         # log. Reaching this first would report it as a row that cannot be read.
         if append:
-            self.__continue_the_root_the_rows_carry(random_seed)
+            # From the checkpoint just validated, not the line count taken when
+            # this object was built: that one counts blank lines and goes stale.
+            self._initial_sim_idx = self.__continue_the_root_the_rows_carry(random_seed)
 
         print("Starting Monte Carlo analysis")
 
@@ -800,8 +808,8 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         also means a fresh object can continue a study, which is the ordinary
         way of resuming one.
         """
-        recorded = _what_the_rows_say_drew_them(self.input_file)
-        stamped = _what_the_rows_say_drew_them(self.output_file)
+        recorded, held = _what_the_rows_say_drew_them(self.input_file)
+        stamped, written = _what_the_rows_say_drew_them(self.output_file)
         named = None if recorded is None else _root_digest(recorded)
         if named != stamped:
             raise ValueError(
@@ -810,18 +818,25 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f"rather than the two halves of one."
             )
         if recorded is None:
-            return
-        held = _rows_a_log_holds(self.input_file)
-        if held != _rows_a_log_holds(self.output_file):
+            return 0
+        if held != written:
             raise ValueError(
                 f"cannot append to {self.input_file}: it and {self.output_file} "
-                f"hold different numbers of rows, so where to carry on from "
-                f"cannot be established."
+                f"do not record the same simulations, so where to carry on "
+                f"from cannot be established."
+            )
+        # Rows arrive in completion order, so these are not sorted. What has
+        # to hold is that between them they are the run's first len(held).
+        if sorted(held) != list(range(len(held))):
+            raise ValueError(
+                f"cannot append to {self.input_file}: the simulations it "
+                f"records are not the run's first {len(held)}, so where to "
+                f"carry on from cannot be established."
             )
         state = _root_state_a_row_records(recorded, self.input_file)
         if random_seed is None:
             self.__root_state = state
-            return
+            return len(held)
         if _root_written_into_a_row(self.__root_state) != recorded:
             raise ValueError(
                 f"cannot append to {self.input_file}: its rows were drawn from "
@@ -829,6 +844,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 f"two studies in one file. Pass the seed the run started with, "
                 f"or leave random_seed out to carry on from the rows."
             )
+        return len(held)
 
     def __seed_this_simulation(self, sim_idx):
         """Reseed the three models from this index's own child of the root.
@@ -1251,6 +1267,13 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                     raise ValueError(
                         "Invalid 'data_collector' key! "
                         f"Variable names overwrites 'export_list' key '{key}'."
+                    )
+                if key == _SIMULATION_ROOT_KEY:
+                    raise ValueError(
+                        f"Invalid 'data_collector' key '{key}'! It is the root "
+                        f"the row was drawn with, which is written after the "
+                        f"collectors run, so a callback under that name would "
+                        f"be run and then discarded."
                     )
                 if not callable(callback):
                     raise ValueError(
