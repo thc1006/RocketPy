@@ -161,6 +161,8 @@ def test_a_collector_cannot_take_over_the_simulation_index(
     )
     analysis.export_list = []
     analysis._export_config = {}
+    # The row also carries which root drew it, which simulate() would have set.
+    analysis._MonteCarlo__root_state = (42, (), 4, 0)
     analysis.data_collector = {"index": lambda _flight: 999}
 
     row = json.loads(analysis._MonteCarlo__evaluate_flight_outputs(None, 7))

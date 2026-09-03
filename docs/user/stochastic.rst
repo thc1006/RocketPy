@@ -297,3 +297,7 @@ better reflecting the inherent uncertainties in rocketry.
     or split over any number of workers, and appending with the same seed
     carries the same stream on. Without it a run draws fresh entropy and
     reproduces nothing.
+
+    What an index fixes is the inputs it draws. A stochastic input reads its
+    nominal from the object it wraps, and a run moves that as it goes, so the
+    flight itself can still differ by which worker took the index.
