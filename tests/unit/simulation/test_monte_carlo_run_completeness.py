@@ -108,6 +108,27 @@ def test_an_index_that_is_not_a_whole_number_is_refused(tmp_path, index):
         _refuse_logs_missing_a_simulation(inputs, outputs, 2)
 
 
+def test_a_stray_index_past_the_rows_is_refused(tmp_path):
+    """A number no run of this length could have produced is not a simulation."""
+    # A worker that claimed one index too many writes exactly this, and the
+    # target alone cannot tell it from a checkpoint that is legitimately longer.
+    rows = [_row(0), _row(1), _row(99)]
+    inputs = _a_log(tmp_path, "stray.inputs.txt", rows)
+    outputs = _a_log(tmp_path, "stray.outputs.txt", rows)
+
+    with pytest.raises(RuntimeError, match="past the 3 it holds"):
+        _refuse_logs_missing_a_simulation(inputs, outputs, 2)
+
+
+def test_the_order_a_parallel_run_finishes_in_is_not_a_hole(tmp_path):
+    """Rows arrive in completion order, which is not sorted and not wrong."""
+    rows = [_row(1), _row(0), _row(2)]
+    inputs = _a_log(tmp_path, "para.inputs.txt", rows)
+    outputs = _a_log(tmp_path, "para.outputs.txt", rows)
+
+    _refuse_logs_missing_a_simulation(inputs, outputs, 3)
+
+
 def test_logs_that_disagree_on_the_order_are_refused(tmp_path):
     """A record goes into both logs under one lock, so the order is the same."""
     inputs = _a_log(tmp_path, "order.inputs.txt", [_row(0), _row(1)])
@@ -164,6 +185,50 @@ def test_no_failure_path_waits_on_a_worker_without_a_bound():
     ]
 
     assert not unbounded, f"join() with no timeout at lines {unbounded}"
+
+
+def test_starting_a_worker_happens_inside_the_cleanup_scope():
+    """A start that fails has to leave the workers before it accounted for."""
+    # Structural for the same reason the unbounded-join check is: it only shows
+    # when a start has already failed, which a unit test cannot make a real
+    # process do. Outside the try, an interrupt there left children running.
+    tree = ast.parse(inspect.getsource(mc_module))
+    run_in_parallel = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "__run_in_parallel"
+    )
+    guarded = [
+        node
+        for handler in ast.walk(run_in_parallel)
+        if isinstance(handler, ast.Try)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "start"
+    ]
+
+    assert guarded, "Process.start() is not inside a try in __run_in_parallel"
+
+
+def test_a_worker_is_recorded_only_once_it_has_started():
+    """A process that never started cannot be joined or terminated."""
+    tree = ast.parse(inspect.getsource(mc_module))
+    run_in_parallel = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "__run_in_parallel"
+    )
+    lines = {"start": None, "append": None}
+    for node in ast.walk(run_in_parallel):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "start":
+                lines["start"] = node.lineno
+            if node.func.attr == "append":
+                lines["append"] = node.lineno
+
+    assert lines["start"] is not None and lines["append"] is not None
+    assert lines["start"] < lines["append"], "appended before it started"
 
 
 def test_a_collector_cannot_take_over_the_simulation_index(

@@ -53,6 +53,10 @@ _MANAGER_IS_GONE = (OSError, EOFError)
 # Bounded, so a lock its dead holder never released cannot pin this worker.
 _REPORT_LOCK_SECONDS = 5.0
 
+# Longer than the exit-code path: a worker that only read the event is healthy
+# and leaving at the end of the simulation in hand, not blocked on a dead lock.
+_REPORTED_FAILURE_GRACE_SECONDS = 60.0
+
 
 def _refuse_logs_this_run_cannot_write(
     input_file, output_file, error_file, export_config=None
@@ -489,20 +493,22 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             processes = []
             seeds = np.random.SeedSequence().spawn(n_workers)
 
-            for seed in seeds:
-                sim_producer = multiprocess.Process(
-                    target=self.__sim_producer,
-                    args=(
-                        seed,
-                        sim_monitor,
-                        mutex,
-                        simulation_error_event,
-                    ),
-                )
-                processes.append(sim_producer)
-                sim_producer.start()
-
             try:
+                for seed in seeds:
+                    sim_producer = multiprocess.Process(
+                        target=self.__sim_producer,
+                        args=(
+                            seed,
+                            sim_monitor,
+                            mutex,
+                            simulation_error_event,
+                        ),
+                    )
+                    sim_producer.start()
+                    # Started first: one that never did cannot be joined, and
+                    # a later start failing still has to bring these down.
+                    processes.append(sim_producer)
+
                 _join_the_workers(processes, simulation_error_event)
 
                 # Before the event: a killed worker never sets it.
@@ -628,7 +634,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         try:
             with suppress(OSError):
                 with open(self.error_file, "a", encoding="utf-8") as f:
-                    f.write(inputs_json or _worker_failure_record(where, details))
+                    f.write(_worker_failure_record(where, details, inputs_json))
             with suppress(OSError, ValueError):
                 # Must use print() to remain visible from a worker process.
                 _SimMonitor.reprint(f"Error on {where}:\n{details}")
@@ -1830,6 +1836,13 @@ def _ended_badly(worker):
     return worker.exitcode not in (None, 0)
 
 
+def _a_failure_was_reported(error_event):
+    """Whether a worker has said it failed, false if it cannot be asked."""
+    with suppress(*_MANAGER_IS_GONE):
+        return error_event.is_set()
+    return False
+
+
 def _wait_for_the_workers(processes, seconds):
     """Join every worker against one shared deadline, not one each.
 
@@ -1864,12 +1877,18 @@ def _stop_the_workers_still_running(processes, error_event, grace_period):
 
 
 def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECONDS):
-    """Wait for the workers, and stop once one of them has died badly.
+    """Wait for the workers, and stop once one of them has failed.
 
-    The shared lock belongs to the manager and outlives a killed holder, so a
-    sibling can block on a lock nobody owns. Neither slowness nor a reported
-    failure ends the wait: a worker that reports leaves nothing behind, and
-    its siblings stop once they finish the simulation in hand.
+    A reported failure ends the wait as well as a bad exit code, since a
+    worker that reports one leaves cleanly and says nothing through its exit
+    status. Its siblings read the event between simulations, but one blocked
+    on a lock nobody owns never reaches that check, and the run is already
+    short a simulation either way, so the wait is bounded here rather than
+    left to them. The reported path gets the longer grace: those siblings are
+    working, not stuck.
+
+    Slowness alone ends nothing. With no failure reported a healthy worker is
+    given as long as it needs.
     """
     while any(worker.is_alive() for worker in processes):
         for worker in processes:
@@ -1877,11 +1896,26 @@ def _join_the_workers(processes, error_event, grace_period=_SHUTDOWN_GRACE_SECON
         if any(_ended_badly(worker) for worker in processes):
             _stop_the_workers_still_running(processes, error_event, grace_period)
             return
+        if _a_failure_was_reported(error_event):
+            _stop_the_workers_still_running(
+                processes, error_event, _REPORTED_FAILURE_GRACE_SECONDS
+            )
+            return
 
 
-def _worker_failure_record(where, details):
-    """A row for a worker that failed before it drew anything."""
-    return json.dumps({"index": None, "stage": where, "error": details}) + "\n"
+def _worker_failure_record(where, details, inputs_json=""):
+    """A row saying what failed, and what the simulation had drawn so far.
+
+    The inputs alone left the error file with no stage and no traceback, which
+    is what the caller is sent there to read.
+    """
+    record = {"index": None, "stage": where, "error": details}
+    with suppress(ValueError):
+        drawn = json.loads(inputs_json)
+        if isinstance(drawn, dict):
+            record["index"] = drawn.get("index")
+            record["inputs"] = drawn
+    return json.dumps(record) + "\n"
 
 
 def _indices_a_log_holds(path):
@@ -1913,9 +1947,12 @@ def _refuse_logs_missing_a_simulation(input_file, output_file, target):
 
     Rows numbered past the target are left alone: an append given a smaller
     target than the checkpoint already holds is an append question, not a lost
-    simulation. The two logs must still agree row for row, since a record goes
-    into both under one lock. Streamed rather than read through
-    ``_read_log_file``, which would hold every row of a long study in memory.
+    simulation. What each log holds still has to be the consecutive run it
+    claims to be, so its indices are required to be exactly as many as its
+    rows, which refuses a stray number and a hole without needing to be told
+    how long the checkpoint was. The two logs must also agree row for row,
+    since a record goes into both under one lock. Streamed rather than read
+    through ``_read_log_file``, which would hold every row in memory.
     """
     wanted = set(range(target))
     recorded = {}
@@ -1939,6 +1976,13 @@ def _refuse_logs_missing_a_simulation(input_file, output_file, target):
                 f"The run is incomplete: the {label} log is missing "
                 f"{len(missing)} of {target} simulations, the first being "
                 f"{missing[0]}."
+            )
+        strays = sorted(held - set(range(len(found))))
+        if strays:
+            raise RuntimeError(
+                f"The run is incomplete: the {label} log numbers a simulation "
+                f"{strays[0]}, past the {len(found)} it holds, so what it "
+                f"records is not one run of consecutive simulations."
             )
 
     if recorded["input"] != recorded["output"]:

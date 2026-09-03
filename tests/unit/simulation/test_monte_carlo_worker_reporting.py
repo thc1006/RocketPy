@@ -351,3 +351,56 @@ def test_a_lock_that_breaks_on_release_does_not_hide_the_failure(tmp_path, capsy
 
     assert error_event.was_set
     assert "the models would not reseed" in capsys.readouterr().out
+
+
+def test_a_failure_after_the_inputs_were_drawn_still_records_why(tmp_path, monkeypatch):
+    """The error file is where the caller is sent, so it has to say what broke."""
+    # Writing the input row on its own left no stage and no traceback there,
+    # for every failure past the point the inputs had been built.
+    _committing_producer(monkeypatch)
+    monkeypatch.setattr(
+        MonteCarlo,
+        "_MonteCarlo__evaluate_flight_outputs",
+        _raise_instead("the outputs would not serialize"),
+    )
+    monitor = SimpleNamespace(keep_simulating=lambda: True, increment=lambda: 1)
+    study, error_event = _a_worker(
+        tmp_path, SimpleNamespace(last_rnd_dict={}, _set_stochastic=lambda _s: None)
+    )
+
+    _run(study, monitor, error_event)
+
+    with open(study.error_file, "r", encoding="utf-8") as written:
+        rows = [json.loads(line) for line in written if line.strip()]
+    assert len(rows) == 1
+    assert "the outputs would not serialize" in rows[0]["error"]
+    assert rows[0]["stage"] == "iteration 0"
+    assert rows[0]["inputs"]["committed"] is True
+
+
+def test_an_input_row_that_is_not_an_object_does_not_break_the_reporter(
+    tmp_path, monkeypatch
+):
+    """Reading the row is best effort: the failure being reported comes first."""
+    _committing_producer(monkeypatch)
+    monkeypatch.setattr(
+        MonteCarlo,
+        "_MonteCarlo__evaluate_flight_inputs",
+        lambda self, index: json.dumps([index]) + "\n",
+    )
+    monkeypatch.setattr(
+        MonteCarlo,
+        "_MonteCarlo__evaluate_flight_outputs",
+        _raise_instead("the outputs would not serialize"),
+    )
+    monitor = SimpleNamespace(keep_simulating=lambda: True, increment=lambda: 1)
+    study, error_event = _a_worker(
+        tmp_path, SimpleNamespace(last_rnd_dict={}, _set_stochastic=lambda _s: None)
+    )
+
+    _run(study, monitor, error_event)
+
+    with open(study.error_file, "r", encoding="utf-8") as written:
+        rows = [json.loads(line) for line in written if line.strip()]
+    assert "the outputs would not serialize" in rows[0]["error"]
+    assert "inputs" not in rows[0]

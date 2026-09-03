@@ -123,19 +123,30 @@ def test_a_slow_run_is_never_bounded():
     assert slower.joins > 50
 
 
-def test_a_reported_failure_leaves_a_working_sibling_alone():
-    """A worker that only reported gives its siblings no reason to be ended."""
-    # Measured: with the event treated as a reason to stop, this sibling was
-    # terminated after three polls of the forty it needed. It was not stuck,
-    # it was mid-simulation, and it would have seen the event and left with
-    # its rows intact.
+def test_a_reported_failure_ends_the_wait():
+    """A worker that reported leaves cleanly, so its exit status says nothing."""
+    # Left alone this waits on the sibling for good, and the run is already
+    # short a simulation whichever way that goes. The sibling is asked first
+    # and gets the longer grace, since one that only read the event is working
+    # rather than blocked on a lock nobody owns.
     reported = _Worker(exitcode=0, alive_for=1)
-    working = _Worker(alive_for=40)
+    stuck = _Worker(never=True)
 
-    _join_the_workers([reported, working], _Event(already_set=True), grace_period=0)
+    _join_the_workers([reported, stuck], _Event(already_set=True), grace_period=0)
 
-    assert not working.terminated
-    assert working.exitcode == 0
+    assert stuck.terminated or stuck.killed
+    assert max(t for t in stuck.timeouts if t is not None) >= 1.0
+
+
+def test_a_sibling_that_finishes_inside_the_grace_is_not_ended():
+    """Asked first, and a worker that leaves on its own is left to do it."""
+    reported = _Worker(exitcode=0, alive_for=1)
+    finishing = _Worker(alive_for=1)
+
+    _join_the_workers([reported, finishing], _Event(already_set=True), grace_period=0)
+
+    assert not finishing.terminated
+    assert finishing.exitcode == 0
 
 
 def test_a_clean_run_is_not_stopped_by_an_event_nobody_set():
