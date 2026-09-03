@@ -16,6 +16,7 @@ latest documentation.
 import csv
 import json
 import os
+import threading
 import traceback
 import warnings
 from copy import deepcopy
@@ -489,11 +490,10 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
         )
         sim_idx = sim_monitor.count
         try:
-            while sim_monitor.keep_simulating():
-                # Counted from zero, as the parallel path already does. The two
-                # named the same simulation differently: three of them wrote
-                # 1, 2, 3 here and 0, 1, 2 there.
-                sim_idx = sim_monitor.increment() - 1
+            # Counted from zero, as the parallel path already does: the two
+            # used to name the same simulation 1, 2, 3 and 0, 1, 2.
+            while (claimed := sim_monitor.claim_next_index()) is not None:
+                sim_idx = claimed
                 inputs_json, outputs_json = "", ""
 
                 self.__seed_this_simulation(sim_idx)
@@ -610,8 +610,7 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             Event signaling an error occurred during the simulation.
         """
         try:
-            while sim_monitor.keep_simulating():
-                sim_idx = sim_monitor.increment() - 1
+            while (sim_idx := sim_monitor.claim_next_index()) is not None:
                 inputs_json, outputs_json = "", ""
 
                 self.__seed_this_simulation(sim_idx)
@@ -911,8 +910,6 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             export_item: getattr(flight, export_item)
             for export_item in self.export_list
         }
-        outputs_dict["index"] = sim_idx
-
         if self.data_collector is not None:
             additional_exports = {}
             for key, callback in self.data_collector.items():
@@ -923,6 +920,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                         f"An error was encountered running 'data_collector' callback {key}. "
                     ) from e
             outputs_dict = outputs_dict | additional_exports
+
+        # After the collectors, so one cannot take the row's own number.
+        outputs_dict["index"] = sim_idx
 
         return (
             json.dumps(outputs_dict, cls=RocketPyEncoder, **self._export_config) + "\n"
@@ -1899,13 +1899,20 @@ class _SimMonitor:
         self.n_simulations = n_simulations
         self.start_time = start_time
         self.completed_count = 0
+        self._claim = threading.Lock()  # proxy calls run in the manager
 
-    def keep_simulating(self):
-        return self.count < self.n_simulations
+    def claim_next_index(self):
+        """The next index to run, or None once every one has been claimed.
 
-    def increment(self):
-        self.count += 1
-        return self.count
+        One call, because a separate check and increment let two workers both
+        see the last slot free and then claim an index each past the end.
+        """
+        with self._claim:
+            if self.count >= self.n_simulations:
+                return None
+            claimed = self.count
+            self.count += 1
+            return claimed
 
     def print_update_status(self):
         """Prints a message on the same line as the previous one and replaces
