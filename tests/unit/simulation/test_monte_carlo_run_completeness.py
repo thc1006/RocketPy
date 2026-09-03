@@ -95,6 +95,28 @@ def test_logs_that_hold_different_simulations_are_refused(tmp_path):
         _refuse_logs_missing_a_simulation(inputs, outputs, 2)
 
 
+@pytest.mark.parametrize("index", [True, False, 1.0, -1, [], "1", None])
+def test_an_index_that_is_not_a_whole_number_is_refused(tmp_path, index):
+    """Only a non-negative int names a simulation, whatever compares equal."""
+    # True and 1.0 both equal 1, so either could stand in for a simulation that
+    # was never run. An unhashable one used to escape as a raw TypeError.
+    rows = [_row(0), _row(index)]
+    inputs = _a_log(tmp_path, "odd.inputs.txt", rows)
+    outputs = _a_log(tmp_path, "odd.outputs.txt", rows)
+
+    with pytest.raises(RuntimeError, match="cannot be read"):
+        _refuse_logs_missing_a_simulation(inputs, outputs, 2)
+
+
+def test_logs_that_disagree_on_the_order_are_refused(tmp_path):
+    """A record goes into both logs under one lock, so the order is the same."""
+    inputs = _a_log(tmp_path, "order.inputs.txt", [_row(0), _row(1)])
+    outputs = _a_log(tmp_path, "order.outputs.txt", [_row(1), _row(0)])
+
+    with pytest.raises(RuntimeError, match="same order"):
+        _refuse_logs_missing_a_simulation(inputs, outputs, 2)
+
+
 def _leave_cleanly_without_recording(_flight):
     # A worker that ends the way an out-of-memory kill ends it, but with the
     # status of one that finished. Nothing about the process says otherwise.

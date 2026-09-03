@@ -13,13 +13,42 @@ class _Mutex:
     def __init__(self):
         self.held = False
         self.acquired = 0
+        self.blocking = None
+        self.timeout = None
 
-    def acquire(self):
+    def acquire(self, blocking=True, timeout=None):  # the proxy's signature
         self.acquired += 1
+        self.blocking, self.timeout = blocking, timeout
         self.held = True
+        return True
 
     def release(self):
         self.held = False
+
+
+class _MutexThatCannotBeTaken(_Mutex):
+    """A lock a dead holder never gave back: acquire waits out its bound."""
+
+    def acquire(self, blocking=True, timeout=None):
+        super().acquire(blocking, timeout)
+        self.held = False
+        return False
+
+
+class _MutexThatBreaksOnAcquire(_Mutex):
+    """The manager is gone, so asking for the lock raises instead."""
+
+    def acquire(self, blocking=True, timeout=None):
+        super().acquire(blocking, timeout)
+        self.held = False
+        raise OSError("the manager is gone")
+
+
+class _MutexThatBreaksOnRelease(_Mutex):
+    """The manager goes while the lock is held, so giving it back raises."""
+
+    def release(self):
+        raise OSError("the manager is gone")
 
 
 class _ErrorEvent:
@@ -290,3 +319,35 @@ def test_a_worker_that_did_announce_its_failure_returns(tmp_path):
     _run(study, SimpleNamespace(keep_simulating=lambda: True), error_event)
 
     assert error_event.was_set
+
+
+@pytest.mark.parametrize(
+    "mutex_class", [_MutexThatCannotBeTaken, _MutexThatBreaksOnAcquire]
+)
+def test_a_lock_the_reporter_cannot_take_does_not_stop_it(
+    tmp_path, capsys, mutex_class
+):
+    """A lock that times out or is gone still leaves the failure announced."""
+    # Asking for it without a bound is how a worker whose sibling died holding
+    # the lock waits forever, with nothing recorded and no exit code to read.
+    monitor = SimpleNamespace(keep_simulating=lambda: True)
+    study, error_event = _a_worker(tmp_path, _refusing_model())
+    mutex = mutex_class()
+
+    _run(study, monitor, error_event, mutex)
+
+    assert error_event.was_set
+    assert "the models would not reseed" in capsys.readouterr().out
+    assert not mutex.held
+    assert mutex.timeout is not None  # asked for with a bound
+
+
+def test_a_lock_that_breaks_on_release_does_not_hide_the_failure(tmp_path, capsys):
+    """Giving the lock back can raise, and must not replace what failed."""
+    monitor = SimpleNamespace(keep_simulating=lambda: True)
+    study, error_event = _a_worker(tmp_path, _refusing_model())
+
+    _run(study, monitor, error_event, _MutexThatBreaksOnRelease())
+
+    assert error_event.was_set
+    assert "the models would not reseed" in capsys.readouterr().out

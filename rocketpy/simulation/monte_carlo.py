@@ -50,6 +50,9 @@ _SIMULATION_INDEX_KEY = "index"
 # How a manager that has gone away answers a proxy call.
 _MANAGER_IS_GONE = (OSError, EOFError)
 
+# Bounded, so a lock its dead holder never released cannot pin this worker.
+_REPORT_LOCK_SECONDS = 5.0
+
 
 def _refuse_logs_this_run_cannot_write(
     input_file, output_file, error_file, export_config=None
@@ -619,7 +622,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
             error_event.set()
             announced = True
 
-        mutex.acquire()
+        held = False
+        with suppress(*_MANAGER_IS_GONE):
+            held = mutex.acquire(timeout=_REPORT_LOCK_SECONDS)
         try:
             with suppress(OSError):
                 with open(self.error_file, "a", encoding="utf-8") as f:
@@ -628,7 +633,9 @@ class MonteCarlo:  # pylint: disable=too-many-public-methods
                 # Must use print() to remain visible from a worker process.
                 _SimMonitor.reprint(f"Error on {where}:\n{details}")
         finally:
-            mutex.release()
+            if held:
+                with suppress(*_MANAGER_IS_GONE):
+                    mutex.release()
         return announced
 
     def __run_single_simulation(self):
@@ -1885,9 +1892,14 @@ def _indices_a_log_holds(path):
             if not line.strip():
                 continue
             try:
-                found.append(json.loads(line)["index"])
+                index = json.loads(line)["index"]
             except (ValueError, KeyError, TypeError):
                 found.append(None)
+                continue
+            usable = (
+                isinstance(index, int) and not isinstance(index, bool) and index >= 0
+            )
+            found.append(index if usable else None)
     return found
 
 
@@ -1901,12 +1913,15 @@ def _refuse_logs_missing_a_simulation(input_file, output_file, target):
 
     Rows numbered past the target are left alone: an append given a smaller
     target than the checkpoint already holds is an append question, not a lost
-    simulation. Streamed rather than read through ``_read_log_file``, which
-    would hold every row of a long study in memory to look at one field.
+    simulation. The two logs must still agree row for row, since a record goes
+    into both under one lock. Streamed rather than read through
+    ``_read_log_file``, which would hold every row of a long study in memory.
     """
     wanted = set(range(target))
+    recorded = {}
     for label, path in (("input", input_file), ("output", output_file)):
         found = _indices_a_log_holds(path)
+        recorded[label] = found
         held = set(found)
         if None in held:
             raise RuntimeError(
@@ -1925,6 +1940,13 @@ def _refuse_logs_missing_a_simulation(input_file, output_file, target):
                 f"{len(missing)} of {target} simulations, the first being "
                 f"{missing[0]}."
             )
+
+    if recorded["input"] != recorded["output"]:
+        raise RuntimeError(
+            "The run is incomplete: the input and output logs do not record "
+            "the same simulations in the same order. A record is written to "
+            "both under one lock, so they hold two different runs."
+        )
 
 
 def _refuse_a_worker_that_did_not_finish(processes):
