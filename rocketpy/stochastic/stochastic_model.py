@@ -16,8 +16,9 @@ def _snapshot_of(value):
 
     Numeric arrays and the built-in containers are copied entry by entry, since
     an array inside an ``airfoil`` tuple would otherwise stay shared. This is
-    not a general deep copy: anything else is returned as it is, shared
-    structure is not rebuilt, and a cycle recurses until Python stops it.
+    not a general deep copy: an ``object`` array is copied without its entries
+    being, anything else is returned as it is, shared structure is not rebuilt,
+    and a cycle recurses until Python stops it.
     """
     if isinstance(value, np.ndarray):
         return value.copy()
